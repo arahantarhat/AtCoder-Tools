@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "AtCoder Problemset",
+  "version": "0.1.0",
+  "description": "Adds Codeforces-style problemset and stats tabs to AtCoder using Kenkoooo difficulty data.",
+  "permissions": ["storage", "unlimitedStorage"],
+  "host_permissions": ["https://kenkoooo.com/*", "https://atcoder.jp/*"],
+  "background": {
+    "service_worker": "dist/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://atcoder.jp/*"],
+      "js": ["dist/content.js"],
+      "css": ["dist/styles.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}

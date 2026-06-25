@@ -1,0 +1,435 @@
+import { mkdirSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname } from "node:path";
+import type { DatabaseSync as DatabaseSyncType, SQLInputValue } from "node:sqlite";
+import type { CacheStore } from "../services/atcoder/data-service";
+import type {
+  AssignmentMode,
+  AssignmentStatus,
+  BotAssignment,
+  LeaderboardEntry,
+  LeaderboardTrendPoint,
+  LinkedUser,
+  MonthlyPoints,
+  ReviewQueueItem,
+  ReviewReason
+} from "./types";
+
+type Row = Record<string, unknown>;
+const require = createRequire(`${process.cwd()}/package.json`);
+const { DatabaseSync } = require("node:sqlite") as { DatabaseSync: typeof DatabaseSyncType };
+
+export class DiscordBotStore implements CacheStore {
+  private readonly db: DatabaseSyncType;
+
+  constructor(path = defaultDataPath()) {
+    if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
+    this.db = new DatabaseSync(path);
+    this.db.exec("PRAGMA foreign_keys = ON");
+    this.db.exec("PRAGMA journal_mode = WAL");
+    this.migrate();
+  }
+
+  close(): void {
+    this.db.close();
+  }
+
+  async get<T>(key: string): Promise<T | undefined> {
+    const row = this.db.prepare("SELECT data FROM cached_json WHERE cache_key = ?").get(key) as Row | undefined;
+    return typeof row?.data === "string" ? JSON.parse(row.data) as T : undefined;
+  }
+
+  async set<T>(key: string, value: T): Promise<void> {
+    this.db.prepare(`
+      INSERT INTO cached_json (cache_key, fetched_at, data)
+      VALUES (?, ?, ?)
+      ON CONFLICT(cache_key) DO UPDATE SET fetched_at = excluded.fetched_at, data = excluded.data
+    `).run(key, Date.now(), JSON.stringify(value));
+  }
+
+  async clearMatching(predicate: (key: string) => boolean): Promise<void> {
+    const rows = this.db.prepare("SELECT cache_key FROM cached_json").all() as Row[];
+    const deleteStatement = this.db.prepare("DELETE FROM cached_json WHERE cache_key = ?");
+    for (const row of rows) {
+      const key = String(row.cache_key);
+      if (predicate(key)) deleteStatement.run(key);
+    }
+  }
+
+  linkUser(guildId: string, discordUserId: string, atcoderUsername: string, initialRating: number, now: number): LinkedUser {
+    const existing = this.getLinkedUser(guildId, discordUserId);
+    const rating = existing?.trainingRating ?? initialRating;
+    this.db.prepare(`
+      INSERT INTO linked_users (guild_id, discord_user_id, atcoder_username, training_rating, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(guild_id, discord_user_id) DO UPDATE SET
+        atcoder_username = excluded.atcoder_username,
+        updated_at = excluded.updated_at
+    `).run(guildId, discordUserId, atcoderUsername, rating, existing?.createdAt ?? now, now);
+    return this.getLinkedUserOrThrow(guildId, discordUserId);
+  }
+
+  getLinkedUser(guildId: string, discordUserId: string): LinkedUser | null {
+    const row = this.db.prepare("SELECT * FROM linked_users WHERE guild_id = ? AND discord_user_id = ?").get(guildId, discordUserId) as Row | undefined;
+    return row ? linkedUserFromRow(row) : null;
+  }
+
+  getLinkedUserOrThrow(guildId: string, discordUserId: string): LinkedUser {
+    const user = this.getLinkedUser(guildId, discordUserId);
+    if (!user) throw new Error("AtCoder handle is not linked. Use /link username:<handle> first.");
+    return user;
+  }
+
+  updateTrainingRating(guildId: string, discordUserId: string, rating: number, now: number): void {
+    this.db.prepare("UPDATE linked_users SET training_rating = ?, updated_at = ? WHERE guild_id = ? AND discord_user_id = ?")
+      .run(rating, now, guildId, discordUserId);
+  }
+
+  createAssignment(input: {
+    guildId: string;
+    discordUserId: string;
+    atcoderUsername: string;
+    mode: AssignmentMode;
+    problemId: string;
+    contestId: string;
+    title: string;
+    difficulty: number;
+    targetDelta: number;
+    points: number;
+    assignedAt: number;
+  }): BotAssignment {
+    if (this.getActiveAssignment(input.guildId, input.discordUserId)) {
+      throw new Error("You already have an active assignment. Use /train current first.");
+    }
+    const result = this.db.prepare(`
+      INSERT INTO assignments (
+        guild_id, discord_user_id, atcoder_username, mode, problem_id, contest_id,
+        title, difficulty, target_delta, points, status, assigned_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
+    `).run(
+      input.guildId,
+      input.discordUserId,
+      input.atcoderUsername,
+      input.mode,
+      input.problemId,
+      input.contestId,
+      input.title,
+      input.difficulty,
+      input.targetDelta,
+      input.points,
+      input.assignedAt
+    );
+    return this.getAssignment(Number(result.lastInsertRowid))!;
+  }
+
+  getAssignment(id: number): BotAssignment | null {
+    const row = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(id) as Row | undefined;
+    return row ? assignmentFromRow(row) : null;
+  }
+
+  getActiveAssignment(guildId: string, discordUserId: string): BotAssignment | null {
+    const row = this.db.prepare(`
+      SELECT * FROM assignments
+      WHERE guild_id = ? AND discord_user_id = ? AND status = 'active'
+      ORDER BY assigned_at DESC
+      LIMIT 1
+    `).get(guildId, discordUserId) as Row | undefined;
+    return row ? assignmentFromRow(row) : null;
+  }
+
+  getUsedProblemIds(guildId: string, discordUserId: string): Set<string> {
+    const rows = this.db.prepare("SELECT problem_id FROM assignments WHERE guild_id = ? AND discord_user_id = ?").all(guildId, discordUserId) as Row[];
+    return new Set(rows.map((row) => String(row.problem_id)));
+  }
+
+  resolveAssignment(assignment: BotAssignment, status: Exclude<AssignmentStatus, "active">, resolvedAt: number): void {
+    this.db.prepare("UPDATE assignments SET status = ?, resolved_at = ? WHERE id = ? AND status = 'active'")
+      .run(status, resolvedAt, assignment.id);
+  }
+
+  addScoreEvent(input: {
+    guildId: string;
+    discordUserId: string;
+    assignmentId: number;
+    points: number;
+    reason: "completed" | "assisted";
+    occurredAt: number;
+    monthKey: string;
+  }): void {
+    this.db.prepare(`
+      INSERT INTO score_events (guild_id, discord_user_id, assignment_id, points, reason, occurred_at, month_key)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(input.guildId, input.discordUserId, input.assignmentId, input.points, input.reason, input.occurredAt, input.monthKey);
+  }
+
+  getPoints(guildId: string, discordUserId: string, monthKey?: string): number {
+    const params: SQLInputValue[] = [guildId, discordUserId];
+    const monthClause = monthKey ? " AND month_key = ?" : "";
+    if (monthKey) params.push(monthKey);
+    const row = this.db.prepare(`
+      SELECT COALESCE(SUM(points), 0) AS points
+      FROM score_events
+      WHERE guild_id = ? AND discord_user_id = ?${monthClause}
+    `).get(...params) as Row | undefined;
+    return Number(row?.points ?? 0);
+  }
+
+  getLeaderboard(guildId: string, monthKey?: string, limit = 10): LeaderboardEntry[] {
+    const params: SQLInputValue[] = [guildId];
+    const monthClause = monthKey ? " AND s.month_key = ?" : "";
+    if (monthKey) params.push(monthKey);
+    params.push(limit);
+    const rows = this.db.prepare(`
+      SELECT s.discord_user_id, u.atcoder_username, SUM(s.points) AS points
+      FROM score_events s
+      LEFT JOIN linked_users u ON u.guild_id = s.guild_id AND u.discord_user_id = s.discord_user_id
+      WHERE s.guild_id = ?${monthClause}
+      GROUP BY s.discord_user_id, u.atcoder_username
+      HAVING points > 0
+      ORDER BY points DESC, s.discord_user_id ASC
+      LIMIT ?
+    `).all(...params) as Row[];
+    return rows.map((row) => ({
+      discordUserId: String(row.discord_user_id),
+      atcoderUsername: typeof row.atcoder_username === "string" ? row.atcoder_username : undefined,
+      points: Number(row.points)
+    }));
+  }
+
+  listAssignmentsForGraph(guildId: string, discordUserId: string, since: number): BotAssignment[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM assignments
+      WHERE guild_id = ? AND discord_user_id = ? AND assigned_at >= ?
+      ORDER BY assigned_at ASC, id ASC
+    `).all(guildId, discordUserId, since) as Row[];
+    return rows.map(assignmentFromRow);
+  }
+
+  getMonthlyPointsSince(guildId: string, discordUserId: string, since: number): MonthlyPoints[] {
+    const rows = this.db.prepare(`
+      SELECT month_key, SUM(points) AS points
+      FROM score_events
+      WHERE guild_id = ? AND discord_user_id = ? AND occurred_at >= ?
+      GROUP BY month_key
+      ORDER BY month_key ASC
+    `).all(guildId, discordUserId, since) as Row[];
+    return rows.map((row) => ({
+      monthKey: String(row.month_key),
+      points: Number(row.points)
+    }));
+  }
+
+  getTopLeaderboardUsersSince(guildId: string, since: number, limit = 5): LeaderboardEntry[] {
+    const rows = this.db.prepare(`
+      SELECT s.discord_user_id, u.atcoder_username, SUM(s.points) AS points
+      FROM score_events s
+      LEFT JOIN linked_users u ON u.guild_id = s.guild_id AND u.discord_user_id = s.discord_user_id
+      WHERE s.guild_id = ? AND s.occurred_at >= ?
+      GROUP BY s.discord_user_id, u.atcoder_username
+      HAVING points > 0
+      ORDER BY points DESC, s.discord_user_id ASC
+      LIMIT ?
+    `).all(guildId, since, limit) as Row[];
+    return rows.map((row) => ({
+      discordUserId: String(row.discord_user_id),
+      atcoderUsername: typeof row.atcoder_username === "string" ? row.atcoder_username : undefined,
+      points: Number(row.points)
+    }));
+  }
+
+  getLeaderboardTrendSince(guildId: string, discordUserIds: string[], since: number): LeaderboardTrendPoint[] {
+    if (discordUserIds.length === 0) return [];
+    const placeholders = discordUserIds.map(() => "?").join(", ");
+    const rows = this.db.prepare(`
+      SELECT s.discord_user_id, u.atcoder_username, s.month_key, SUM(s.points) AS points
+      FROM score_events s
+      LEFT JOIN linked_users u ON u.guild_id = s.guild_id AND u.discord_user_id = s.discord_user_id
+      WHERE s.guild_id = ? AND s.occurred_at >= ? AND s.discord_user_id IN (${placeholders})
+      GROUP BY s.discord_user_id, u.atcoder_username, s.month_key
+      ORDER BY s.month_key ASC, s.discord_user_id ASC
+    `).all(guildId, since, ...discordUserIds) as Row[];
+    return rows.map((row) => ({
+      discordUserId: String(row.discord_user_id),
+      atcoderUsername: typeof row.atcoder_username === "string" ? row.atcoder_username : undefined,
+      monthKey: String(row.month_key),
+      points: Number(row.points)
+    }));
+  }
+
+  enqueueReview(input: {
+    guildId: string;
+    discordUserId: string;
+    problemId: string;
+    contestId: string;
+    title: string;
+    difficulty: number;
+    reason: ReviewReason;
+    availableAfter: number;
+    createdAt: number;
+  }): void {
+    this.db.prepare(`
+      INSERT INTO review_queue (
+        guild_id, discord_user_id, problem_id, contest_id, title, difficulty,
+        reason, available_after, created_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.guildId,
+      input.discordUserId,
+      input.problemId,
+      input.contestId,
+      input.title,
+      input.difficulty,
+      input.reason,
+      input.availableAfter,
+      input.createdAt
+    );
+  }
+
+  listReviewQueue(guildId: string, discordUserId: string, now?: number): ReviewQueueItem[] {
+    const params: SQLInputValue[] = [guildId, discordUserId];
+    const dueClause = now === undefined ? "" : " AND available_after <= ?";
+    if (now !== undefined) params.push(now);
+    const rows = this.db.prepare(`
+      SELECT * FROM review_queue
+      WHERE guild_id = ? AND discord_user_id = ? AND consumed_at IS NULL${dueClause}
+      ORDER BY available_after ASC
+      LIMIT 10
+    `).all(...params) as Row[];
+    return rows.map(reviewItemFromRow);
+  }
+
+  countQueued(guildId: string, discordUserId: string): number {
+    const row = this.db.prepare(`
+      SELECT COUNT(*) AS count FROM review_queue
+      WHERE guild_id = ? AND discord_user_id = ? AND consumed_at IS NULL
+    `).get(guildId, discordUserId) as Row | undefined;
+    return Number(row?.count ?? 0);
+  }
+
+  consumeReviewItem(id: number, now: number): void {
+    this.db.prepare("UPDATE review_queue SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL").run(now, id);
+  }
+
+  private migrate(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS linked_users (
+        guild_id TEXT NOT NULL,
+        discord_user_id TEXT NOT NULL,
+        atcoder_username TEXT NOT NULL,
+        training_rating INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (guild_id, discord_user_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS assignments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT NOT NULL,
+        discord_user_id TEXT NOT NULL,
+        atcoder_username TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        problem_id TEXT NOT NULL,
+        contest_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        difficulty INTEGER NOT NULL,
+        target_delta INTEGER NOT NULL,
+        points INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        assigned_at INTEGER NOT NULL,
+        resolved_at INTEGER
+      );
+
+      CREATE INDEX IF NOT EXISTS ix_assignments_active
+      ON assignments (guild_id, discord_user_id, status);
+
+      CREATE TABLE IF NOT EXISTS score_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT NOT NULL,
+        discord_user_id TEXT NOT NULL,
+        assignment_id INTEGER NOT NULL,
+        points INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        occurred_at INTEGER NOT NULL,
+        month_key TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS ix_score_events_leaderboard
+      ON score_events (guild_id, month_key, discord_user_id);
+
+      CREATE TABLE IF NOT EXISTS review_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT NOT NULL,
+        discord_user_id TEXT NOT NULL,
+        problem_id TEXT NOT NULL,
+        contest_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        difficulty INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        available_after INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        consumed_at INTEGER
+      );
+
+      CREATE INDEX IF NOT EXISTS ix_review_queue_due
+      ON review_queue (guild_id, discord_user_id, consumed_at, available_after);
+
+      CREATE TABLE IF NOT EXISTS cached_json (
+        cache_key TEXT PRIMARY KEY,
+        fetched_at INTEGER NOT NULL,
+        data TEXT NOT NULL
+      );
+    `);
+  }
+}
+
+export function defaultDataPath(): string {
+  return process.env.DISCORD_DATA_PATH ?? "data/bot.sqlite";
+}
+
+function linkedUserFromRow(row: Row): LinkedUser {
+  return {
+    guildId: String(row.guild_id),
+    discordUserId: String(row.discord_user_id),
+    atcoderUsername: String(row.atcoder_username),
+    trainingRating: Number(row.training_rating),
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at)
+  };
+}
+
+function assignmentFromRow(row: Row): BotAssignment {
+  return {
+    id: Number(row.id),
+    guildId: String(row.guild_id),
+    discordUserId: String(row.discord_user_id),
+    atcoderUsername: String(row.atcoder_username),
+    mode: String(row.mode) as AssignmentMode,
+    problemId: String(row.problem_id),
+    contestId: String(row.contest_id),
+    title: String(row.title),
+    difficulty: Number(row.difficulty),
+    targetDelta: Number(row.target_delta),
+    points: Number(row.points),
+    status: String(row.status) as AssignmentStatus,
+    assignedAt: Number(row.assigned_at),
+    resolvedAt: row.resolved_at === null ? undefined : Number(row.resolved_at)
+  };
+}
+
+function reviewItemFromRow(row: Row): ReviewQueueItem {
+  return {
+    id: Number(row.id),
+    guildId: String(row.guild_id),
+    discordUserId: String(row.discord_user_id),
+    problemId: String(row.problem_id),
+    contestId: String(row.contest_id),
+    title: String(row.title),
+    difficulty: Number(row.difficulty),
+    reason: String(row.reason) as ReviewReason,
+    availableAfter: Number(row.available_after),
+    createdAt: Number(row.created_at),
+    consumedAt: row.consumed_at === null ? undefined : Number(row.consumed_at)
+  };
+}

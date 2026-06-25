@@ -1,0 +1,57 @@
+{
+  "name": "atcoder-problemset-extension",
+  "productName": "AtCoder Dashboard",
+  "description": "Personal macOS launcher and localhost dashboard for AtCoder problemset, training, and progress.",
+  "author": "Tomas Fernandez",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist-electron/main.cjs",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "bot:build": "node scripts/build-bot.mjs",
+    "bot:start": "npm run bot:build && node dist-discord/bot.cjs",
+    "start": "npm run build && electron .",
+    "dist:mac": "npm run check && electron-builder --mac dir --arm64",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check:boundaries": "node scripts/check-boundaries.mjs",
+    "check": "npm run typecheck && npm run test && npm run check:boundaries && npm run build && npm run bot:build"
+  },
+  "devDependencies": {
+    "@types/chrome": "0.0.306",
+    "@types/jsdom": "^21.1.7",
+    "@types/node": "^25.9.2",
+    "electron": "^42.4.0",
+    "electron-builder": "^26.15.2",
+    "esbuild": "0.19.12",
+    "jsdom": "^22.1.0",
+    "typescript": "^5.7.3",
+    "vitest": "0.34.6"
+  },
+  "build": {
+    "appId": "local.tomas.atcoder-dashboard",
+    "productName": "AtCoder Dashboard",
+    "asar": true,
+    "files": [
+      "dist-electron/**/*",
+      "dist-web/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dir"
+      ],
+      "identity": null
+    },
+    "directories": {
+      "output": "release"
+    }
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "^1.0.1",
+    "chart.js": "^4.5.1",
+    "discord.js": "^14.26.4"
+  }
+}
