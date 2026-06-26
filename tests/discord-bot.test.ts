@@ -7,7 +7,7 @@ import { pointsForDelta, reviewDelaySeconds, updateTrainingRating } from "../src
 import { DiscordTrainingBotService } from "../src/discord/service";
 import { DiscordBotStore } from "../src/discord/storage";
 import { getUtcMonthKey } from "../src/discord/time";
-import type { DiscordAtCoderService } from "../src/discord/atcoder";
+import { profileAffiliationHasVerificationCode, type DiscordAtCoderService } from "../src/discord/atcoder";
 import type { AtCoderDataset, OfficialRatingPoint } from "../src/types";
 
 const dataset: AtCoderDataset = {
@@ -177,6 +177,21 @@ describe("Discord bot storage", () => {
     ]);
     store.close();
   });
+
+  it("keeps the last training rating event per UTC day", () => {
+    const store = new DiscordBotStore(":memory:");
+    store.linkUser("guild", "1", "tourist", 1200, 1);
+    store.recordTrainingRating("guild", "1", 1300, Math.floor(Date.parse("2026-06-25T10:00:00Z") / 1000));
+    store.recordTrainingRating("guild", "1", 1250, Math.floor(Date.parse("2026-06-25T09:00:00Z") / 1000));
+    store.recordTrainingRating("guild", "1", 1400, Math.floor(Date.parse("2026-06-25T23:00:00Z") / 1000));
+    store.recordTrainingRating("guild", "1", 1425, Math.floor(Date.parse("2026-06-26T01:00:00Z") / 1000));
+
+    expect(store.getTrainingRatingHistorySince("guild", "1", Math.floor(Date.parse("2026-06-25T00:00:00Z") / 1000))).toEqual([
+      { dayKey: "2026-06-25", epochSecond: Math.floor(Date.parse("2026-06-25T23:00:00Z") / 1000), rating: 1400 },
+      { dayKey: "2026-06-26", epochSecond: Math.floor(Date.parse("2026-06-26T01:00:00Z") / 1000), rating: 1425 }
+    ]);
+    store.close();
+  });
 });
 
 describe("Discord graph rendering", () => {
@@ -195,11 +210,60 @@ describe("Discord graph rendering", () => {
   });
 });
 
+describe("Discord AtCoder adapter", () => {
+  it("finds a profile verification code in the Affiliation row", () => {
+    expect(profileAffiliationHasVerificationCode(`
+      <table class="dl-table">
+        <tr><th class="no-break">Affiliation</th><td class="break-all">Team ACD-k7F3Q9Zp</td></tr>
+      </table>
+    `, "ACD-k7F3Q9Zp")).toBe(true);
+  });
+
+  it("does not match a profile verification code outside Affiliation", () => {
+    expect(profileAffiliationHasVerificationCode(`
+      <table class="dl-table">
+        <tr><th class="no-break">X(Twitter) ID</th><td>ACD-k7F3Q9Zp</td></tr>
+        <tr><th class="no-break">Affiliation</th><td class="break-all">ITMO University</td></tr>
+      </table>
+    `, "ACD-k7F3Q9Zp")).toBe(false);
+  });
+});
+
 describe("Discord bot service", () => {
+  it("requires a fresh profile code before linking an AtCoder handle", async () => {
+    const store = new DiscordBotStore(":memory:");
+    const service = new DiscordTrainingBotService(store, fakeAtCoder(true, [], false));
+    const pending = await service.linkUser("guild", "1", "tourist", 1_700_000_000);
+
+    expect(pending.status).toBe("pending");
+    expect(store.getLinkedUser("guild", "1")).toBeNull();
+    const challenge = store.getPendingLinkChallenge("guild", "1");
+    expect(challenge?.atcoderUsername).toBe("tourist");
+    expect(challenge?.verificationType).toBe("profile_code");
+    expect(challenge?.verificationCode).toMatch(/^ACD-/);
+
+    const stillPending = await service.linkUser("guild", "1", "tourist", 1_700_000_060);
+
+    expect(stillPending.status).toBe("pending");
+    expect(store.getLinkedUser("guild", "1")).toBeNull();
+    store.close();
+  });
+
+  it("links the handle after the requested profile code is visible", async () => {
+    const store = new DiscordBotStore(":memory:");
+    const service = new DiscordTrainingBotService(store, fakeAtCoder(true));
+
+    const user = await linkForTest(service, "guild", "1", "tourist", 1_700_000_000);
+
+    expect(user.atcoderUsername).toBe("tourist");
+    expect(store.getPendingLinkChallenge("guild", "1")).toBeNull();
+    store.close();
+  });
+
   it("awards points after verified AC and queues assisted reviews", async () => {
     const store = new DiscordBotStore(":memory:");
     const service = new DiscordTrainingBotService(store, fakeAtCoder(true));
-    await service.linkUser("guild", "1", "tourist", 1_700_000_000);
+    await linkForTest(service, "guild", "1", "tourist", 1_700_000_000);
     await service.startTraining("guild", "1", 0, 1_700_000_100);
     const result = await service.resolveTraining("guild", "1", "assisted", 1_700_000_200);
 
@@ -212,7 +276,7 @@ describe("Discord bot service", () => {
   it("does not let /gimme block a later training assignment", async () => {
     const store = new DiscordBotStore(":memory:");
     const service = new DiscordTrainingBotService(store, fakeAtCoder(true));
-    await service.linkUser("guild", "1", "tourist", 1_700_000_000);
+    await linkForTest(service, "guild", "1", "tourist", 1_700_000_000);
     await service.gimme("guild", "1", { color: "green" }, 1_700_000_050);
     const assignment = await service.startTraining("guild", "1", 0, 1_700_000_100);
 
@@ -220,14 +284,41 @@ describe("Discord bot service", () => {
     store.close();
   });
 
-  it("keeps assignment active when AC is not verified", async () => {
+  it("releases the active assignment while completion waits for verification", async () => {
     const store = new DiscordBotStore(":memory:");
     const service = new DiscordTrainingBotService(store, fakeAtCoder(false));
-    await service.linkUser("guild", "1", "tourist", 1_700_000_000);
+    await linkForTest(service, "guild", "1", "tourist", 1_700_000_000);
     await service.startTraining("guild", "1", 0, 1_700_000_100);
 
-    await expect(service.resolveTraining("guild", "1", "completed", 1_700_000_200)).rejects.toThrow(/could not find an AC/i);
-    expect(store.getActiveAssignment("guild", "1")).not.toBeNull();
+    const result = await service.resolveTraining("guild", "1", "completed", 1_700_000_200);
+
+    expect(result.verification).toBe("pending");
+    expect(result.points).toBe(0);
+    expect(result.rating).toBeNull();
+    expect(store.getActiveAssignment("guild", "1")).toBeNull();
+    expect(store.listPendingVerificationForUser("guild", "1")).toHaveLength(1);
+    expect(store.getPoints("guild", "1", "2023-11")).toBe(0);
+    await expect(service.startTraining("guild", "1", 0, 1_700_000_300)).resolves.toMatchObject({ mode: "train" });
+    store.close();
+  });
+
+  it("awards pending completion points after later public verification", async () => {
+    let solved = false;
+    const store = new DiscordBotStore(":memory:");
+    const service = new DiscordTrainingBotService(store, fakeAtCoder(() => solved));
+    await linkForTest(service, "guild", "1", "tourist", 1_700_000_000);
+    const assignment = await service.startTraining("guild", "1", 0, 1_700_000_100);
+
+    await service.resolveTraining("guild", "1", "completed", 1_700_000_200);
+    expect(store.getPoints("guild", "1", "2023-11")).toBe(0);
+
+    solved = true;
+    const result = await service.verifyPendingAssignmentsForUser("guild", "1", 1_700_000_300);
+
+    expect(result).toEqual({ checked: 1, verified: 1, remaining: 0 });
+    expect(store.getAssignment(assignment.id)?.status).toBe("completed");
+    expect(store.getPoints("guild", "1", "2023-11")).toBe(8);
+    expect(store.getLinkedUserOrThrow("guild", "1").trainingRating).toBeGreaterThan(1200);
     store.close();
   });
 
@@ -245,7 +336,13 @@ describe("Discord bot service", () => {
       "graph"
     ]);
     const graph = commands.find((command) => command.name === "graph");
-    expect(graph?.options?.map((option) => option.name)).toEqual(["official", "difficulty", "delta", "points", "leaderboard"]);
+    expect(graph?.options?.map((option) => option.name)).toEqual(["official", "training", "points", "solved", "leaderboard"]);
+    for (const subcommand of graph?.options ?? []) {
+      if (subcommand.name === "solved") continue;
+      const options = "options" in subcommand ? subcommand.options : undefined;
+      const range = options?.find((option) => option.name === "range");
+      expect(range && "choices" in range ? range.choices?.map((choice) => choice.value) : undefined).toEqual(["30d", "90d", "6m", "1y", "full"]);
+    }
   });
 
   it("builds official graph replies and empty graph responses", async () => {
@@ -256,7 +353,7 @@ describe("Discord bot service", () => {
     ];
     const store = new DiscordBotStore(":memory:");
     const service = new DiscordTrainingBotService(store, fakeAtCoder(true, history));
-    await service.linkUser("guild", "1", "tourist", now);
+    await linkForTest(service, "guild", "1", "tourist", now);
 
     const reply = await graphReply("official", fakeUser("1"), null, "guild", service, store, now);
     expect(reply.content).toContain("official rating vs performance");
@@ -265,6 +362,50 @@ describe("Discord bot service", () => {
 
     const empty = await graphReply("points", fakeUser("1"), null, "guild", service, store, now);
     expect(empty.content).toMatch(/No verified points/);
+    store.close();
+  });
+
+  it("defaults graphs to 90 days and allows full history", async () => {
+    const now = Math.floor(Date.parse("2026-06-25T00:00:00Z") / 1000);
+    const history: OfficialRatingPoint[] = [
+      { epochSecond: now - 200 * 24 * 60 * 60, rating: 1300, performance: 1350, contestName: "ABC 350" }
+    ];
+    const store = new DiscordBotStore(":memory:");
+    const service = new DiscordTrainingBotService(store, fakeAtCoder(true, history));
+    await linkForTest(service, "guild", "1", "tourist", now);
+
+    const defaultReply = await graphReply("official", fakeUser("1"), null, "guild", service, store, now);
+    expect(defaultReply.content).toMatch(/last 90 days/);
+
+    const fullReply = await graphReply("official", fakeUser("1"), null, "guild", service, store, now, "full");
+    expect(fullReply.content).toContain("official rating vs performance");
+    expect(fullReply.files).toHaveLength(1);
+    store.close();
+  });
+
+  it("records and graphs daily training ELO", async () => {
+    const store = new DiscordBotStore(":memory:");
+    const service = new DiscordTrainingBotService(store, fakeAtCoder(true));
+    await linkForTest(service, "guild", "1", "tourist", 1_700_000_000);
+    await service.startTraining("guild", "1", 0, Math.floor(Date.parse("2026-06-25T10:00:00Z") / 1000));
+    await service.resolveTraining("guild", "1", "completed", Math.floor(Date.parse("2026-06-25T11:00:00Z") / 1000));
+
+    const reply = await graphReply("training", fakeUser("1"), null, "guild", service, store, Math.floor(Date.parse("2026-06-26T00:00:00Z") / 1000));
+    expect(reply.content).toContain("daily training ELO");
+    expect(reply.files).toHaveLength(1);
+    expect((reply.files?.[0] as { name?: string } | undefined)?.name).toBe("training-elo.png");
+    store.close();
+  });
+
+  it("builds solved difficulty histogram replies", async () => {
+    const store = new DiscordBotStore(":memory:");
+    const service = new DiscordTrainingBotService(store, fakeAtCoder(true));
+    await linkForTest(service, "guild", "1", "tourist", 1_780_000_000);
+
+    const reply = await graphReply("solved", fakeUser("1"), null, "guild", service, store, 1_780_000_000);
+    expect(reply.content).toContain("solved problems by 100-point difficulty band");
+    expect(reply.files).toHaveLength(1);
+    expect((reply.files?.[0] as { name?: string } | undefined)?.name).toBe("solved-difficulty-histogram.png");
     store.close();
   });
 
@@ -278,12 +419,30 @@ describe("Discord bot service", () => {
   });
 });
 
-function fakeAtCoder(solved: boolean, history: OfficialRatingPoint[] = []): DiscordAtCoderService {
+async function linkForTest(
+  service: DiscordTrainingBotService,
+  guildId: string,
+  discordUserId: string,
+  username: string,
+  now: number
+) {
+  const pending = await service.linkUser(guildId, discordUserId, username, now);
+  expect(pending.status).toBe("pending");
+  const linked = await service.linkUser(guildId, discordUserId, username, now + 60);
+  expect(linked.status).toBe("linked");
+  if (linked.status !== "linked") throw new Error("Link did not complete.");
+  return linked.user;
+}
+
+function fakeAtCoder(solved: boolean | (() => boolean), history: OfficialRatingPoint[] = [], linkChallengeVerified = true): DiscordAtCoderService {
+  const isSolved = () => typeof solved === "function" ? solved() : solved;
   return {
     getInitialRating: async () => 1200,
     getRatingHistory: async () => history,
     getDataset: async () => dataset,
-    hasAcceptedSubmission: async () => solved
+    hasProfileVerificationCode: async () => linkChallengeVerified,
+    hasAcceptedSubmission: async () => isSolved(),
+    hasSubmissionResult: async (_username: string, _contestId: string, _problemId: string, result: string) => result === "CE" ? linkChallengeVerified : isSolved()
   } as unknown as DiscordAtCoderService;
 }
 

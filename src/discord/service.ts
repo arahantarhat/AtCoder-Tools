@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import type { AtCoderDataset } from "../types";
 import { selectRandomProblem, selectTrainingProblem } from "./problem-selection";
 import { reviewDelaySeconds, updateTrainingRating } from "./scoring";
@@ -5,12 +6,55 @@ import { getUtcMonthKey } from "./time";
 import type { DiscordAtCoderService } from "./atcoder";
 import type { DiscordBotStore } from "./storage";
 import type { OfficialRatingPoint } from "../types";
-import type { BotAssignment, ProblemFilters } from "./types";
+import type { BotAssignment, LinkedUser, PendingLinkChallenge, ProblemFilters, ScoreReason } from "./types";
+
+type TrainingOutcome = "completed" | "assisted" | "skipped";
+
+export type LinkUserResult =
+  | { status: "pending"; challenge: PendingLinkChallenge }
+  | { status: "linked"; user: LinkedUser };
+
+export interface TrainingResolutionResult {
+  assignment: BotAssignment;
+  outcome: TrainingOutcome;
+  verification: "verified" | "pending" | "not_required";
+  points: number;
+  rating: number | null;
+}
+
+export interface PendingVerificationResult {
+  checked: number;
+  verified: number;
+  remaining: number;
+}
 
 export class DiscordTrainingBotService {
   constructor(private readonly store: DiscordBotStore, private readonly atcoder: DiscordAtCoderService) {}
 
-  async linkUser(guildId: string, discordUserId: string, username: string, now = nowSecond()) {
+  async linkUser(guildId: string, discordUserId: string, username: string, now = nowSecond()): Promise<LinkUserResult> {
+    const pending = this.store.getPendingLinkChallenge(guildId, discordUserId);
+    if (pending?.atcoderUsername === username && pending.verificationCode) {
+      const verified = await this.atcoder.hasProfileVerificationCode(username, pending.verificationCode);
+      if (verified) {
+        const user = await this.createLinkedUser(guildId, discordUserId, username, now);
+        this.store.clearPendingLinkChallenge(guildId, discordUserId);
+        return { status: "linked", user };
+      }
+      return { status: "pending", challenge: pending };
+    }
+
+    const challenge = this.store.savePendingLinkChallenge({
+      guildId,
+      discordUserId,
+      atcoderUsername: username,
+      verificationCode: createLinkVerificationCode(),
+      issuedAt: now,
+      updatedAt: now
+    });
+    return { status: "pending", challenge };
+  }
+
+  private async createLinkedUser(guildId: string, discordUserId: string, username: string, now: number): Promise<LinkedUser> {
     const initialRating = await this.atcoder.getInitialRating(username);
     return this.store.linkUser(guildId, discordUserId, username, initialRating, now);
   }
@@ -65,45 +109,61 @@ export class DiscordTrainingBotService {
     return this.atcoder.getRatingHistory(username);
   }
 
+  getDataset(username: string): Promise<AtCoderDataset> {
+    return this.atcoder.getDataset(username);
+  }
+
   async resolveTraining(
     guildId: string,
     discordUserId: string,
-    outcome: "completed" | "assisted" | "skipped",
+    outcome: TrainingOutcome,
     now = nowSecond()
-  ): Promise<{ assignment: BotAssignment; points: number; rating: number }> {
+  ): Promise<TrainingResolutionResult> {
     const user = this.store.getLinkedUserOrThrow(guildId, discordUserId);
     const assignment = this.store.getActiveAssignment(guildId, discordUserId);
     if (!assignment) throw new Error("You do not have an active assignment.");
-    if (outcome !== "skipped") {
-      const solved = await this.atcoder.hasAcceptedSubmission(user.atcoderUsername, assignment.contestId, assignment.problemId, assignment.assignedAt);
-      if (!solved) throw new Error("I could not find an AC for this assignment yet. Try again after AtCoder shows the submission.");
-      this.store.addScoreEvent({
-        guildId,
-        discordUserId,
-        assignmentId: assignment.id,
-        points: assignment.points,
-        reason: outcome,
-        occurredAt: now,
-        monthKey: getUtcMonthKey(now)
-      });
+
+    if (outcome === "skipped") {
+      this.store.resolveAssignment(assignment, outcome, now);
+      this.enqueueReview(assignment, outcome, now);
+      const rating = this.updateRating(guildId, discordUserId, user.trainingRating, outcome, assignment.targetDelta, now);
+      return { assignment, outcome, verification: "not_required", points: 0, rating };
     }
+
+    const solved = await this.atcoder.hasAcceptedSubmission(user.atcoderUsername, assignment.contestId, assignment.problemId, assignment.assignedAt);
+    if (!solved) {
+      this.store.resolveAssignment(assignment, pendingStatusFor(outcome), now);
+      return { assignment, outcome, verification: "pending", points: 0, rating: null };
+    }
+
+    const rating = this.verifyScoredAssignment(assignment, outcome, now, now, user.trainingRating);
     this.store.resolveAssignment(assignment, outcome, now);
-    if (outcome === "assisted" || outcome === "skipped") {
-      this.store.enqueueReview({
-        guildId,
-        discordUserId,
-        problemId: assignment.problemId,
-        contestId: assignment.contestId,
-        title: assignment.title,
-        difficulty: assignment.difficulty,
-        reason: outcome,
-        availableAfter: now + reviewDelaySeconds(outcome),
-        createdAt: now
-      });
+    return { assignment, outcome, verification: "verified", points: assignment.points, rating };
+  }
+
+  async verifyPendingAssignments(now = nowSecond(), limit = 50): Promise<PendingVerificationResult> {
+    return this.verifyPendingList(this.store.listPendingVerification(limit), now);
+  }
+
+  async verifyPendingAssignmentsForUser(guildId: string, discordUserId: string, now = nowSecond()): Promise<PendingVerificationResult> {
+    return this.verifyPendingList(this.store.listPendingVerificationForUser(guildId, discordUserId), now);
+  }
+
+  private async verifyPendingList(assignments: BotAssignment[], now: number): Promise<PendingVerificationResult> {
+    let verified = 0;
+    for (const assignment of assignments) {
+      const outcome = outcomeFromPendingStatus(assignment.status);
+      if (!outcome) continue;
+      const solved = await this.atcoder.hasAcceptedSubmission(assignment.atcoderUsername, assignment.contestId, assignment.problemId, assignment.assignedAt);
+      if (!solved) continue;
+      const user = this.store.getLinkedUser(assignment.guildId, assignment.discordUserId);
+      if (!user) continue;
+      if (!this.store.completePendingVerification(assignment, outcome)) continue;
+      const claimAt = assignment.resolvedAt ?? now;
+      this.verifyScoredAssignment(assignment, outcome, claimAt, now, user.trainingRating);
+      verified += 1;
     }
-    const rating = updateTrainingRating(user.trainingRating, outcome, assignment.targetDelta);
-    this.store.updateTrainingRating(guildId, discordUserId, rating, now);
-    return { assignment, points: outcome === "skipped" ? 0 : assignment.points, rating };
+    return { checked: assignments.length, verified, remaining: assignments.length - verified };
   }
 
   async startReview(guildId: string, discordUserId: string, now = nowSecond()): Promise<BotAssignment> {
@@ -130,8 +190,70 @@ export class DiscordTrainingBotService {
   getDatasetForTests(username: string): Promise<AtCoderDataset> {
     return this.atcoder.getDataset(username);
   }
+
+  private verifyScoredAssignment(
+    assignment: BotAssignment,
+    outcome: ScoreReason,
+    claimAt: number,
+    verifiedAt: number,
+    currentRating: number
+  ): number {
+    this.store.addScoreEvent({
+      guildId: assignment.guildId,
+      discordUserId: assignment.discordUserId,
+      assignmentId: assignment.id,
+      points: assignment.points,
+      reason: outcome,
+      occurredAt: claimAt,
+      monthKey: getUtcMonthKey(claimAt)
+    });
+    if (outcome === "assisted") this.enqueueReview(assignment, outcome, claimAt);
+    return this.updateRating(assignment.guildId, assignment.discordUserId, currentRating, outcome, assignment.targetDelta, verifiedAt);
+  }
+
+  private updateRating(
+    guildId: string,
+    discordUserId: string,
+    currentRating: number,
+    outcome: TrainingOutcome,
+    targetDelta: number,
+    now: number
+  ): number {
+    const rating = updateTrainingRating(currentRating, outcome, targetDelta);
+    this.store.updateTrainingRating(guildId, discordUserId, rating, now);
+    this.store.recordTrainingRating(guildId, discordUserId, rating, now);
+    return rating;
+  }
+
+  private enqueueReview(assignment: BotAssignment, reason: "assisted" | "skipped", now: number): void {
+    this.store.enqueueReview({
+      guildId: assignment.guildId,
+      discordUserId: assignment.discordUserId,
+      problemId: assignment.problemId,
+      contestId: assignment.contestId,
+      title: assignment.title,
+      difficulty: assignment.difficulty,
+      reason,
+      availableAfter: now + reviewDelaySeconds(reason),
+      createdAt: now
+    });
+  }
 }
 
 function nowSecond(): number {
   return Math.floor(Date.now() / 1000);
+}
+
+function createLinkVerificationCode(): string {
+  return `ACD-${randomBytes(6).toString("base64url")}`;
+}
+
+function pendingStatusFor(outcome: ScoreReason): "pending_completed" | "pending_assisted" {
+  return outcome === "completed" ? "pending_completed" : "pending_assisted";
+}
+
+function outcomeFromPendingStatus(status: BotAssignment["status"]): ScoreReason | null {
+  if (status === "pending_completed") return "completed";
+  if (status === "pending_assisted") return "assisted";
+  return null;
 }

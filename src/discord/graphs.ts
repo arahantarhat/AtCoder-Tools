@@ -1,31 +1,25 @@
 import type { InteractionReplyOptions, User } from "discord.js";
-import type { OfficialRatingPoint } from "../types";
-import { renderBarChart, renderLineChart, renderStackedBarChart, type LineSeries } from "./charts";
+import type { AtCoderDataset, OfficialRatingPoint } from "../types";
+import { renderBarChart, renderHistogramChart, renderLineChart, type LineSeries } from "./charts";
 import { getUtcMonthKey } from "./time";
 import type { DiscordTrainingBotService } from "./service";
 import type { DiscordBotStore } from "./storage";
-import type { AssignmentStatus, BotAssignment, DifficultyColor, LeaderboardEntry } from "./types";
+import type { LeaderboardEntry } from "./types";
 
-const DEFAULT_WINDOW_DAYS = 90;
 const DAY_SECONDS = 24 * 60 * 60;
-const STATUS_SERIES: Array<{ status: AssignmentStatus; label: string; color: string }> = [
-  { status: "completed", label: "Completed", color: "#16a34a" },
-  { status: "assisted", label: "Assisted", color: "#2563eb" },
-  { status: "skipped", label: "Skipped", color: "#dc2626" },
-  { status: "active", label: "Active", color: "#9ca3af" }
-];
-const DIFFICULTY_BANDS: Array<{ label: DifficultyColor; min: number; max: number }> = [
-  { label: "gray", min: 0, max: 399 },
-  { label: "brown", min: 400, max: 799 },
-  { label: "green", min: 800, max: 1199 },
-  { label: "cyan", min: 1200, max: 1599 },
-  { label: "blue", min: 1600, max: 1999 },
-  { label: "yellow", min: 2000, max: 2399 },
-  { label: "orange", min: 2400, max: 2799 },
-  { label: "red", min: 2800, max: Number.POSITIVE_INFINITY }
-];
-const DELTAS = [-300, -200, -100, 0, 100, 200, 300] as const;
 const LINE_COLORS = ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c"];
+const GRAPH_RANGES: Record<string, { label: string; days?: number | undefined }> = {
+  "30d": { label: "last 30 days", days: 30 },
+  "90d": { label: "last 90 days", days: 90 },
+  "6m": { label: "last 6 months", days: 183 },
+  "1y": { label: "last 1 year", days: 365 },
+  full: { label: "full history" }
+};
+
+interface GraphRange {
+  label: string;
+  since?: number | undefined;
+}
 
 export async function graphReply(
   subcommand: string,
@@ -34,15 +28,16 @@ export async function graphReply(
   guildId: string,
   service: DiscordTrainingBotService,
   store: DiscordBotStore,
-  now = Math.floor(Date.now() / 1000)
+  now = Math.floor(Date.now() / 1000),
+  rangeValue?: string | null
 ): Promise<InteractionReplyOptions> {
   const target = targetUser ?? interactionUser;
-  const since = now - DEFAULT_WINDOW_DAYS * DAY_SECONDS;
-  if (subcommand === "official") return officialGraphReply(guildId, target, service, store, since);
-  if (subcommand === "difficulty") return difficultyGraphReply(guildId, target, store, since);
-  if (subcommand === "delta") return deltaGraphReply(guildId, target, store, since);
-  if (subcommand === "points") return pointsGraphReply(guildId, target, store, since, now);
-  if (subcommand === "leaderboard") return leaderboardGraphReply(guildId, store, since, now);
+  const range = parseGraphRange(rangeValue, now);
+  if (subcommand === "official") return officialGraphReply(guildId, target, service, store, range);
+  if (subcommand === "training") return trainingGraphReply(guildId, target, store, range);
+  if (subcommand === "points") return pointsGraphReply(guildId, target, store, range, now);
+  if (subcommand === "leaderboard") return leaderboardGraphReply(guildId, store, range, now);
+  if (subcommand === "solved") return solvedHistogramGraphReply(guildId, target, service, store);
   return { content: "Unknown graph." };
 }
 
@@ -51,12 +46,12 @@ async function officialGraphReply(
   target: User,
   service: DiscordTrainingBotService,
   store: DiscordBotStore,
-  since: number
+  range: GraphRange
 ): Promise<InteractionReplyOptions> {
   const user = store.getLinkedUserOrThrow(guildId, target.id);
   const history = (await service.getOfficialRatingHistory(user.atcoderUsername))
-    .filter((point) => point.epochSecond >= since);
-  if (history.length === 0) return { content: `No rated AtCoder contests found for <@${target.id}> in the last ${DEFAULT_WINDOW_DAYS} days.` };
+    .filter((point) => range.since === undefined || point.epochSecond >= range.since);
+  if (history.length === 0) return { content: `No rated AtCoder contests found for <@${target.id}> in ${range.label}.` };
   const series: LineSeries[] = [
     {
       label: "Rating",
@@ -88,51 +83,37 @@ async function officialGraphReply(
   );
 }
 
-async function difficultyGraphReply(guildId: string, target: User, store: DiscordBotStore, since: number): Promise<InteractionReplyOptions> {
+async function trainingGraphReply(guildId: string, target: User, store: DiscordBotStore, range: GraphRange): Promise<InteractionReplyOptions> {
   const user = store.getLinkedUserOrThrow(guildId, target.id);
-  const assignments = store.listAssignmentsForGraph(guildId, target.id, since);
-  if (assignments.length === 0) return { content: `No assignments found for <@${target.id}> in the last ${DEFAULT_WINDOW_DAYS} days.` };
-  const labels = DIFFICULTY_BANDS.map((band) => band.label);
-  const series = STATUS_SERIES.map(({ status, label, color }) => ({
-    label,
-    color,
-    values: DIFFICULTY_BANDS.map((band) => assignments.filter((assignment) =>
-      assignment.status === status && assignment.difficulty >= band.min && assignment.difficulty <= band.max
-    ).length)
-  }));
+  const history = store.getTrainingRatingHistorySince(guildId, target.id, range.since ?? 0);
+  if (history.length === 0) return { content: `No training ELO history found for <@${target.id}> in ${range.label}.` };
   return attachmentReply(
-    `${user.atcoderUsername} problem difficulty distribution`,
-    "difficulty-distribution.png",
-    await renderStackedBarChart(`${user.atcoderUsername}: problem difficulty distribution`, labels, series)
+    `${user.atcoderUsername} daily training ELO`,
+    "training-elo.png",
+    await renderLineChart(
+      `${user.atcoderUsername}: daily training ELO`,
+      [{
+        label: "Training ELO",
+        color: "#2563eb",
+        points: history.map((point) => ({
+          x: point.epochSecond,
+          y: point.rating,
+          label: `${point.dayKey}: ${point.rating}`
+        }))
+      }],
+      history.map((point) => point.dayKey.slice(5)),
+      { ratingBands: true }
+    )
   );
 }
 
-async function deltaGraphReply(guildId: string, target: User, store: DiscordBotStore, since: number): Promise<InteractionReplyOptions> {
+async function pointsGraphReply(guildId: string, target: User, store: DiscordBotStore, range: GraphRange, now: number): Promise<InteractionReplyOptions> {
   const user = store.getLinkedUserOrThrow(guildId, target.id);
-  const assignments = store.listAssignmentsForGraph(guildId, target.id, since)
-    .filter((assignment) => assignment.mode === "train" && assignment.status !== "active");
-  if (assignments.length === 0) return { content: `No resolved training assignments found for <@${target.id}> in the last ${DEFAULT_WINDOW_DAYS} days.` };
-  const labels = DELTAS.map((delta) => `${delta >= 0 ? "+" : ""}${delta}`);
-  const series = STATUS_SERIES
-    .filter((entry) => entry.status !== "active")
-    .map(({ status, label, color }) => ({
-      label,
-      color,
-      values: DELTAS.map((delta) => assignments.filter((assignment) => assignment.status === status && assignment.targetDelta === delta).length)
-    }));
-  return attachmentReply(
-    `${user.atcoderUsername} outcomes by training delta`,
-    "training-delta-outcomes.png",
-    await renderStackedBarChart(`${user.atcoderUsername}: outcomes by training delta`, labels, series)
-  );
-}
-
-async function pointsGraphReply(guildId: string, target: User, store: DiscordBotStore, since: number, now: number): Promise<InteractionReplyOptions> {
-  const user = store.getLinkedUserOrThrow(guildId, target.id);
-  const months = monthKeysBetween(since, now);
-  const pointsByMonth = new Map(store.getMonthlyPointsSince(guildId, target.id, since).map((point) => [point.monthKey, point.points]));
+  const points = store.getMonthlyPointsSince(guildId, target.id, range.since ?? 0);
+  if (points.length === 0) return { content: `No verified points found for <@${target.id}> in ${range.label}.` };
+  const months = monthKeysBetween(range.since ?? monthKeyToEpochSecond(points[0]?.monthKey ?? getUtcMonthKey(now)), now);
+  const pointsByMonth = new Map(points.map((point) => [point.monthKey, point.points]));
   const values = months.map((month) => pointsByMonth.get(month) ?? 0);
-  if (values.every((value) => value === 0)) return { content: `No verified points found for <@${target.id}> in the last ${DEFAULT_WINDOW_DAYS} days.` };
   return attachmentReply(
     `${user.atcoderUsername} monthly points`,
     "monthly-points.png",
@@ -140,16 +121,38 @@ async function pointsGraphReply(guildId: string, target: User, store: DiscordBot
   );
 }
 
-async function leaderboardGraphReply(guildId: string, store: DiscordBotStore, since: number, now: number): Promise<InteractionReplyOptions> {
+async function leaderboardGraphReply(guildId: string, store: DiscordBotStore, range: GraphRange, now: number): Promise<InteractionReplyOptions> {
+  const since = range.since ?? 0;
   const leaders = store.getTopLeaderboardUsersSince(guildId, since, 5);
-  if (leaders.length === 0) return { content: `No leaderboard points found in the last ${DEFAULT_WINDOW_DAYS} days.` };
-  const months = monthKeysBetween(since, now);
+  if (leaders.length === 0) return { content: `No leaderboard points found in ${range.label}.` };
   const trend = store.getLeaderboardTrendSince(guildId, leaders.map((entry) => entry.discordUserId), since);
+  const months = monthKeysBetween(range.since ?? monthKeyToEpochSecond(trend[0]?.monthKey ?? getUtcMonthKey(now)), now);
   const series = leaders.map((leader, index) => cumulativeSeries(leader, index, months, trend));
   return attachmentReply(
     "Server leaderboard trend",
     "leaderboard-trend.png",
     await renderLineChart("Server leaderboard trend", series, months)
+  );
+}
+
+async function solvedHistogramGraphReply(
+  guildId: string,
+  target: User,
+  service: DiscordTrainingBotService,
+  store: DiscordBotStore
+): Promise<InteractionReplyOptions> {
+  const user = store.getLinkedUserOrThrow(guildId, target.id);
+  const bins = buildSolvedDifficultyBins(await service.getDataset(user.atcoderUsername));
+  if (bins.length === 0) return { content: `No solved problems with known difficulty found for <@${target.id}>.` };
+  return attachmentReply(
+    `${user.atcoderUsername} solved problems by 100-point difficulty band`,
+    "solved-difficulty-histogram.png",
+    await renderHistogramChart(
+      `${user.atcoderUsername}: solved problems by difficulty`,
+      bins.map((bin) => `${bin.start}-${bin.start + 99}`),
+      bins.map((bin) => bin.count),
+      bins.map((bin) => difficultyColor(bin.start))
+    )
   );
 }
 
@@ -197,4 +200,49 @@ function monthKeysBetween(since: number, now: number): string[] {
     cursor.setUTCMonth(cursor.getUTCMonth() + 1);
   }
   return months;
+}
+
+function parseGraphRange(value: string | null | undefined, now: number): GraphRange {
+  const range = GRAPH_RANGES[value ?? "90d"] ?? GRAPH_RANGES["90d"]!;
+  return {
+    label: range.label,
+    since: range.days === undefined ? undefined : now - range.days * DAY_SECONDS
+  };
+}
+
+function monthKeyToEpochSecond(monthKey: string): number {
+  const time = Date.parse(`${monthKey}-01T00:00:00Z`);
+  return Number.isFinite(time) ? Math.floor(time / 1000) : 0;
+}
+
+function buildSolvedDifficultyBins(dataset: AtCoderDataset): Array<{ start: number; count: number }> {
+  const solvedIds = new Set(dataset.submissions
+    .filter((submission) => submission.result === "AC")
+    .map((submission) => submission.problem_id));
+  const counts = new Map<number, number>();
+  for (const problemId of solvedIds) {
+    const difficulty = dataset.models[problemId]?.difficulty;
+    if (difficulty === undefined || !Number.isFinite(difficulty)) continue;
+    const start = Math.max(0, Math.floor(difficulty / 100) * 100);
+    counts.set(start, (counts.get(start) ?? 0) + 1);
+  }
+  if (counts.size === 0) return [];
+  const min = Math.min(...counts.keys());
+  const max = Math.max(...counts.keys());
+  const bins: Array<{ start: number; count: number }> = [];
+  for (let start = min; start <= max; start += 100) {
+    bins.push({ start, count: counts.get(start) ?? 0 });
+  }
+  return bins;
+}
+
+function difficultyColor(start: number): string {
+  if (start < 400) return "#9ca3af";
+  if (start < 800) return "#8b5a2b";
+  if (start < 1200) return "#16a34a";
+  if (start < 1600) return "#0891b2";
+  if (start < 2000) return "#2563eb";
+  if (start < 2400) return "#ca8a04";
+  if (start < 2800) return "#ea580c";
+  return "#dc2626";
 }

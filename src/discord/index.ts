@@ -11,11 +11,15 @@ const store = new DiscordBotStore();
 const atcoder = new DiscordAtCoderService(store);
 const service = new DiscordTrainingBotService(store, atcoder);
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const pendingVerificationInterval = setInterval(() => {
+  void verifyPendingAssignments();
+}, 5 * 60 * 1000);
 
 client.once(Events.ClientReady, async (readyClient) => {
   const applicationId = process.env.DISCORD_CLIENT_ID ?? readyClient.user.id;
   await registerDiscordCommands(token, applicationId, process.env.DISCORD_GUILD_ID);
   console.log(`AtCoder Discord bot logged in as ${readyClient.user.tag}`);
+  void verifyPendingAssignments();
 });
 
 client.on(Events.InteractionCreate, (interaction) => {
@@ -30,7 +34,19 @@ process.once("SIGTERM", () => shutdown());
 void client.login(token);
 
 function shutdown(): void {
+  clearInterval(pendingVerificationInterval);
   store.close();
   client.destroy();
   process.exit(0);
+}
+
+async function verifyPendingAssignments(): Promise<void> {
+  try {
+    const result = await service.verifyPendingAssignments();
+    if (result.verified > 0) {
+      console.log(`Verified ${result.verified} pending AtCoder assignment(s). ${result.remaining} remain pending.`);
+    }
+  } catch (error) {
+    console.error("Pending assignment verification failed", error);
+  }
 }

@@ -6,12 +6,13 @@ import type { BotAssignment, LeaderboardEntry, LinkedUser, ReviewQueueItem } fro
 export function helpMessage(): string {
   return [
     "**AtCoder training bot**",
-    "1. `/link username:<atcoder>` to connect your AtCoder handle.",
+    "1. `/link username:<atcoder>` to connect your AtCoder handle with a public profile code.",
     "2. `/gimme` for a filtered random problem.",
     "3. `/train start` for an adaptive gitgud-style problem.",
-    "4. Use Completed, Assisted, or Skip buttons, or `/train completed`, `/train assisted`, `/train skip`.",
-    "5. `/queue` reviews assisted/skipped problems later.",
-    "6. `/points`, `/leaderboard`, `/profile`, and `/graph` show progress."
+    "4. Use Completed, Assisted, or Skip buttons. Completion points are awarded after public AC verification.",
+    "5. Use `/train verify` to retry pending completion checks.",
+    "6. `/queue` reviews assisted/skipped problems later.",
+    "7. `/points`, `/leaderboard`, `/profile`, and `/graph` show progress."
   ].join("\n");
 }
 
@@ -51,7 +52,7 @@ export function leaderboardMessage(entries: LeaderboardEntry[], label: string): 
   }).join("\n");
 }
 
-export function profileMessage(user: LinkedUser, monthlyPoints: number, totalPoints: number, active: BotAssignment | null, queued: number): string {
+export function profileMessage(user: LinkedUser, monthlyPoints: number, totalPoints: number, active: BotAssignment | null, pending: number, queued: number): string {
   const current = active
     ? `[${active.title}](${problemUrl(active.contestId, active.problemId)}) (${active.difficulty})`
     : "None";
@@ -61,6 +62,7 @@ export function profileMessage(user: LinkedUser, monthlyPoints: number, totalPoi
     `Monthly points: **${monthlyPoints}**`,
     `All-time points: **${totalPoints}**`,
     `Active assignment: ${current}`,
+    `Pending verification: **${pending}**`,
     `Review queue: **${queued}**`
   ].join("\n");
 }

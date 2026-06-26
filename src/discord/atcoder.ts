@@ -23,21 +23,59 @@ export class DiscordAtCoderService {
     return this.dataService.getRatingHistory(username);
   }
 
-  async hasAcceptedSubmission(username: string, contestId: string, problemId: string, fromSecond: number): Promise<boolean> {
-    const direct = await this.fetchContestSubmissions(username, contestId).catch((): Submission[] | null => null);
-    if (direct?.some((submission) => isAcceptedAfter(submission, problemId, fromSecond))) return true;
-    const fallback = await this.dataService.getRecentSubmissions(username, fromSecond, [{ contestId, problemId }]).catch((): Submission[] => []);
-    return fallback.some((submission) => isAcceptedAfter(submission, problemId, fromSecond));
+  async hasProfileVerificationCode(username: string, code: string): Promise<boolean> {
+    if (!code) return false;
+    const response = await this.fetchImpl(`https://atcoder.jp/users/${encodeURIComponent(username)}`);
+    if (!response.ok) return false;
+    const html = await response.text();
+    if (html.includes("404 Not Found - AtCoder")) return false;
+    return profileAffiliationHasVerificationCode(html, code);
   }
 
-  private async fetchContestSubmissions(username: string, contestId: string): Promise<Submission[]> {
-    const url = `https://atcoder.jp/contests/${encodeURIComponent(contestId)}/submissions?f.User=${encodeURIComponent(username)}&f.Task=&f.LanguageName=&f.Status=AC`;
+  async hasAcceptedSubmission(username: string, contestId: string, problemId: string, fromSecond: number): Promise<boolean> {
+    return this.hasSubmissionResult(username, contestId, problemId, "AC", fromSecond);
+  }
+
+  async hasSubmissionResult(username: string, contestId: string, problemId: string, result: string, fromSecond: number): Promise<boolean> {
+    const direct = await this.fetchContestSubmissions(username, contestId, result).catch((): Submission[] | null => null);
+    if (direct?.some((submission) => isResultAfter(submission, problemId, result, fromSecond))) return true;
+    const fallback = await this.dataService.getRecentSubmissions(username, fromSecond, [{ contestId, problemId }]).catch((): Submission[] => []);
+    return fallback.some((submission) => isResultAfter(submission, problemId, result, fromSecond));
+  }
+
+  private async fetchContestSubmissions(username: string, contestId: string, result: string): Promise<Submission[]> {
+    const url = `https://atcoder.jp/contests/${encodeURIComponent(contestId)}/submissions?f.User=${encodeURIComponent(username)}&f.Task=&f.LanguageName=&f.Status=${encodeURIComponent(result)}`;
     const response = await this.fetchImpl(url);
     if (!response.ok) throw new Error(`AtCoder submissions request failed: ${response.status} ${response.statusText}`);
     return parseAtCoderSubmissions(await response.text(), username, contestId);
   }
 }
 
-function isAcceptedAfter(submission: Submission, problemId: string, fromSecond: number): boolean {
-  return submission.problem_id === problemId && submission.result === "AC" && submission.epoch_second >= fromSecond;
+function isResultAfter(submission: Submission, problemId: string, result: string, fromSecond: number): boolean {
+  return submission.problem_id === problemId && submission.result === result && submission.epoch_second >= fromSecond;
+}
+
+export function profileAffiliationHasVerificationCode(html: string, code: string): boolean {
+  const rows = html.match(/<tr[\s\S]*?<\/tr>/g) ?? [];
+  for (const row of rows) {
+    const cells = row.match(/<(?:th|td)[^>]*>[\s\S]*?<\/(?:th|td)>/g) ?? [];
+    if (cells.length < 2) continue;
+    const [labelCell, valueCell] = cells;
+    if (!labelCell || !valueCell) continue;
+    const label = decodeHtml(labelCell.replace(/<[^>]*>/g, " ")).replace(/\s+/g, " ").trim();
+    if (label !== "Affiliation") continue;
+    const value = decodeHtml(valueCell.replace(/<[^>]*>/g, " ")).replace(/\s+/g, " ").trim();
+    return value.includes(code);
+  }
+  return false;
+}
+
+function decodeHtml(value: string): string {
+  return value
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#43;/g, "+");
 }

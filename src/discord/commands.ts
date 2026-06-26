@@ -1,4 +1,4 @@
-import { SlashCommandBuilder } from "@discordjs/builders";
+import { SlashCommandBuilder, type SlashCommandStringOption } from "@discordjs/builders";
 import { Routes, type RESTPostAPIChatInputApplicationCommandsJSONBody } from "discord-api-types/v10";
 import type {
   ButtonInteraction,
@@ -9,9 +9,9 @@ import { CONTEST_TYPES, type ContestType } from "../shared/contest-types";
 import { graphReply } from "./graphs";
 import { assignmentEmbed, helpMessage, leaderboardMessage, profileMessage, queueMessage, trainingButtons } from "./messages";
 import { parseDateToEpochSecond, getUtcMonthKey } from "./time";
-import type { DiscordTrainingBotService } from "./service";
+import type { DiscordTrainingBotService, PendingVerificationResult, TrainingResolutionResult } from "./service";
 import type { DiscordBotStore } from "./storage";
-import type { DifficultyColor, ProblemFilters } from "./types";
+import type { DifficultyColor, PendingLinkChallenge, ProblemFilters } from "./types";
 
 export function buildDiscordCommands(): RESTPostAPIChatInputApplicationCommandsJSONBody[] {
   return [
@@ -56,7 +56,8 @@ export function buildDiscordCommands(): RESTPostAPIChatInputApplicationCommandsJ
       .addSubcommand((command) => command.setName("current").setDescription("Show your active training assignment."))
       .addSubcommand((command) => command.setName("completed").setDescription("Mark your active assignment as completed without editorial help."))
       .addSubcommand((command) => command.setName("assisted").setDescription("Mark your active assignment as AC with editorial or help."))
-      .addSubcommand((command) => command.setName("skip").setDescription("Skip your active assignment without points.")),
+      .addSubcommand((command) => command.setName("skip").setDescription("Skip your active assignment without points."))
+      .addSubcommand((command) => command.setName("verify").setDescription("Check your pending completion claims now.")),
     new SlashCommandBuilder()
       .setName("queue")
       .setDescription("View or start due review problems.")
@@ -89,22 +90,26 @@ export function buildDiscordCommands(): RESTPostAPIChatInputApplicationCommandsJ
       .addSubcommand((command) => command
         .setName("official")
         .setDescription("Graph official AtCoder rating and contest performance.")
-        .addUserOption((option) => option.setName("user").setDescription("Discord user")))
+        .addUserOption((option) => option.setName("user").setDescription("Discord user"))
+        .addStringOption(addGraphRangeOption))
       .addSubcommand((command) => command
-        .setName("difficulty")
-        .setDescription("Graph assigned problem difficulties by outcome.")
-        .addUserOption((option) => option.setName("user").setDescription("Discord user")))
-      .addSubcommand((command) => command
-        .setName("delta")
-        .setDescription("Graph training outcomes by target delta.")
-        .addUserOption((option) => option.setName("user").setDescription("Discord user")))
+        .setName("training")
+        .setDescription("Graph daily training ELO.")
+        .addUserOption((option) => option.setName("user").setDescription("Discord user"))
+        .addStringOption(addGraphRangeOption))
       .addSubcommand((command) => command
         .setName("points")
         .setDescription("Graph monthly verified points.")
+        .addUserOption((option) => option.setName("user").setDescription("Discord user"))
+        .addStringOption(addGraphRangeOption))
+      .addSubcommand((command) => command
+        .setName("solved")
+        .setDescription("Graph solved problems by 100-point difficulty band.")
         .addUserOption((option) => option.setName("user").setDescription("Discord user")))
       .addSubcommand((command) => command
         .setName("leaderboard")
-        .setDescription("Graph server leaderboard trend."))
+        .setDescription("Graph server leaderboard trend.")
+        .addStringOption(addGraphRangeOption))
   ].map((command) => command.toJSON());
 }
 
@@ -146,8 +151,12 @@ async function routeCommand(interaction: ChatInputCommandInteraction, service: D
       return;
     case "link": {
       const username = interaction.options.getString("username", true).trim();
-      const user = await service.linkUser(guildId, discordUserId, username);
-      await interaction.reply(`Linked <@${discordUserId}> to AtCoder **${user.atcoderUsername}**. Training rating starts at **${user.trainingRating}**.`);
+      const result = await service.linkUser(guildId, discordUserId, username);
+      if (result.status === "linked") {
+        await interaction.reply(`Linked <@${discordUserId}> to AtCoder **${result.user.atcoderUsername}**. You can remove the verification code from your AtCoder profile. Training rating starts at **${result.user.trainingRating}**.`);
+        return;
+      }
+      await interaction.reply({ content: linkChallengeMessage(result.challenge), ephemeral: true });
       return;
     }
     case "gimme": {
@@ -185,6 +194,7 @@ async function routeCommand(interaction: ChatInputCommandInteraction, service: D
         store.getPoints(guildId, target.id, month),
         store.getPoints(guildId, target.id),
         store.getActiveAssignment(guildId, target.id),
+        store.countPendingVerification(guildId, target.id),
         store.countQueued(guildId, target.id)
       ));
       return;
@@ -196,12 +206,24 @@ async function routeCommand(interaction: ChatInputCommandInteraction, service: D
         interaction.options.getUser("user"),
         guildId,
         service,
-        store
+        store,
+        undefined,
+        interaction.options.getString("range")
       );
       await interaction.reply(reply);
       return;
     }
   }
+}
+
+function linkChallengeMessage(challenge: PendingLinkChallenge): string {
+  return [
+    `To link AtCoder **${challenge.atcoderUsername}**, add this code to your public AtCoder Affiliation field:`,
+    "",
+    challenge.verificationCode,
+    "",
+    "Then run `/link` with the same username again. You can remove the code after linking."
+  ].join("\n");
 }
 
 async function handleTrainCommand(interaction: ChatInputCommandInteraction, service: DiscordTrainingBotService): Promise<void> {
@@ -222,7 +244,12 @@ async function handleTrainCommand(interaction: ChatInputCommandInteraction, serv
   if (subcommand === "completed" || subcommand === "assisted" || subcommand === "skip") {
     const outcome = subcommand === "skip" ? "skipped" : subcommand;
     const result = await service.resolveTraining(guildId, discordUserId, outcome);
-    await interaction.reply(`${result.assignment.title}: ${outcome}. ${result.points} points awarded. Training rating is now ${result.rating}.`);
+    await interaction.reply(trainingResolutionMessage(result));
+    return;
+  }
+  if (subcommand === "verify") {
+    const result = await service.verifyPendingAssignmentsForUser(guildId, discordUserId);
+    await interaction.reply(pendingVerificationMessage(result));
   }
 }
 
@@ -248,10 +275,30 @@ async function handleButton(interaction: ButtonInteraction, service: DiscordTrai
   try {
     const outcome = action === "skip" ? "skipped" : action;
     const result = await service.resolveTraining(interaction.guildId, interaction.user.id, outcome);
-    await interaction.reply(`${result.assignment.title}: ${outcome}. ${result.points} points awarded. Training rating is now ${result.rating}.`);
+    await interaction.reply(trainingResolutionMessage(result));
   } catch (error) {
     await interaction.reply({ content: error instanceof Error ? error.message : "Button action failed.", ephemeral: true });
   }
+}
+
+function trainingResolutionMessage(result: TrainingResolutionResult): string {
+  if (result.verification === "pending") {
+    return [
+      `${result.assignment.title}: ${result.outcome} claimed.`,
+      "I could not verify the AC yet, so no points or rating change were applied.",
+      "The assignment was released; you can start another one while I wait for Kenkoooo/AtCoder to show the AC."
+    ].join(" ");
+  }
+  if (result.verification === "not_required") {
+    return `${result.assignment.title}: skipped. 0 points awarded. Training rating is now ${result.rating}.`;
+  }
+  return `${result.assignment.title}: ${result.outcome}. ${result.points} points awarded. Training rating is now ${result.rating}.`;
+}
+
+function pendingVerificationMessage(result: PendingVerificationResult): string {
+  if (result.checked === 0) return "You have no pending completion claims.";
+  if (result.verified === 0) return `Checked ${result.checked} pending claim(s). No new ACs were visible yet.`;
+  return `Verified ${result.verified} pending claim(s). ${result.remaining} still pending.`;
 }
 
 function readProblemFilters(interaction: ChatInputCommandInteraction): ProblemFilters {
@@ -282,4 +329,17 @@ function colorChoices(): Array<{ name: DifficultyColor; value: DifficultyColor }
     name: color as DifficultyColor,
     value: color as DifficultyColor
   }));
+}
+
+function addGraphRangeOption(option: SlashCommandStringOption): SlashCommandStringOption {
+  return option
+    .setName("range")
+    .setDescription("Date range")
+    .addChoices(
+      { name: "30 days", value: "30d" },
+      { name: "90 days", value: "90d" },
+      { name: "6 months", value: "6m" },
+      { name: "1 year", value: "1y" },
+      { name: "full history", value: "full" }
+    );
 }

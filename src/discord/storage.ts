@@ -11,8 +11,11 @@ import type {
   LeaderboardTrendPoint,
   LinkedUser,
   MonthlyPoints,
+  PendingLinkChallenge,
+  ScoreReason,
   ReviewQueueItem,
-  ReviewReason
+  ReviewReason,
+  TrainingRatingPoint
 } from "./types";
 
 type Row = Record<string, unknown>;
@@ -80,9 +83,70 @@ export class DiscordBotStore implements CacheStore {
     return user;
   }
 
+  savePendingLinkChallenge(input: {
+    guildId: string;
+    discordUserId: string;
+    atcoderUsername: string;
+    verificationCode: string;
+    issuedAt: number;
+    updatedAt: number;
+  }): PendingLinkChallenge {
+    this.db.prepare(`
+      INSERT INTO pending_link_challenges (
+        guild_id, discord_user_id, atcoder_username, problem_id, contest_id,
+        title, verification_type, verification_code, issued_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(guild_id, discord_user_id) DO UPDATE SET
+        atcoder_username = excluded.atcoder_username,
+        problem_id = excluded.problem_id,
+        contest_id = excluded.contest_id,
+        title = excluded.title,
+        verification_type = excluded.verification_type,
+        verification_code = excluded.verification_code,
+        issued_at = excluded.issued_at,
+        updated_at = excluded.updated_at
+    `).run(
+      input.guildId,
+      input.discordUserId,
+      input.atcoderUsername,
+      "",
+      "",
+      "",
+      "profile_code",
+      input.verificationCode,
+      input.issuedAt,
+      input.updatedAt
+    );
+    return this.getPendingLinkChallenge(input.guildId, input.discordUserId)!;
+  }
+
+  getPendingLinkChallenge(guildId: string, discordUserId: string): PendingLinkChallenge | null {
+    const row = this.db.prepare("SELECT * FROM pending_link_challenges WHERE guild_id = ? AND discord_user_id = ?")
+      .get(guildId, discordUserId) as Row | undefined;
+    return row ? pendingLinkChallengeFromRow(row) : null;
+  }
+
+  clearPendingLinkChallenge(guildId: string, discordUserId: string): void {
+    this.db.prepare("DELETE FROM pending_link_challenges WHERE guild_id = ? AND discord_user_id = ?")
+      .run(guildId, discordUserId);
+  }
+
   updateTrainingRating(guildId: string, discordUserId: string, rating: number, now: number): void {
     this.db.prepare("UPDATE linked_users SET training_rating = ?, updated_at = ? WHERE guild_id = ? AND discord_user_id = ?")
       .run(rating, now, guildId, discordUserId);
+  }
+
+  recordTrainingRating(guildId: string, discordUserId: string, rating: number, occurredAt: number): void {
+    const dayKey = getUtcDayKey(occurredAt);
+    this.db.prepare(`
+      INSERT INTO training_rating_events (guild_id, discord_user_id, day_key, rating, occurred_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(guild_id, discord_user_id, day_key) DO UPDATE SET
+        rating = excluded.rating,
+        occurred_at = excluded.occurred_at
+      WHERE excluded.occurred_at >= training_rating_events.occurred_at
+    `).run(guildId, discordUserId, dayKey, rating, occurredAt);
   }
 
   createAssignment(input: {
@@ -138,6 +202,34 @@ export class DiscordBotStore implements CacheStore {
     return row ? assignmentFromRow(row) : null;
   }
 
+  listPendingVerification(limit = 50): BotAssignment[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM assignments
+      WHERE status IN ('pending_completed', 'pending_assisted')
+      ORDER BY resolved_at ASC, assigned_at ASC, id ASC
+      LIMIT ?
+    `).all(limit) as Row[];
+    return rows.map(assignmentFromRow);
+  }
+
+  listPendingVerificationForUser(guildId: string, discordUserId: string, limit = 10): BotAssignment[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM assignments
+      WHERE guild_id = ? AND discord_user_id = ? AND status IN ('pending_completed', 'pending_assisted')
+      ORDER BY resolved_at ASC, assigned_at ASC, id ASC
+      LIMIT ?
+    `).all(guildId, discordUserId, limit) as Row[];
+    return rows.map(assignmentFromRow);
+  }
+
+  countPendingVerification(guildId: string, discordUserId: string): number {
+    const row = this.db.prepare(`
+      SELECT COUNT(*) AS count FROM assignments
+      WHERE guild_id = ? AND discord_user_id = ? AND status IN ('pending_completed', 'pending_assisted')
+    `).get(guildId, discordUserId) as Row | undefined;
+    return Number(row?.count ?? 0);
+  }
+
   getUsedProblemIds(guildId: string, discordUserId: string): Set<string> {
     const rows = this.db.prepare("SELECT problem_id FROM assignments WHERE guild_id = ? AND discord_user_id = ?").all(guildId, discordUserId) as Row[];
     return new Set(rows.map((row) => String(row.problem_id)));
@@ -148,12 +240,21 @@ export class DiscordBotStore implements CacheStore {
       .run(status, resolvedAt, assignment.id);
   }
 
+  completePendingVerification(assignment: BotAssignment, status: "completed" | "assisted"): boolean {
+    const result = this.db.prepare(`
+      UPDATE assignments
+      SET status = ?
+      WHERE id = ? AND status = ?
+    `).run(status, assignment.id, assignment.status);
+    return result.changes > 0;
+  }
+
   addScoreEvent(input: {
     guildId: string;
     discordUserId: string;
     assignmentId: number;
     points: number;
-    reason: "completed" | "assisted";
+    reason: ScoreReason;
     occurredAt: number;
     monthKey: string;
   }): void {
@@ -254,6 +355,20 @@ export class DiscordBotStore implements CacheStore {
       atcoderUsername: typeof row.atcoder_username === "string" ? row.atcoder_username : undefined,
       monthKey: String(row.month_key),
       points: Number(row.points)
+    }));
+  }
+
+  getTrainingRatingHistorySince(guildId: string, discordUserId: string, since: number): TrainingRatingPoint[] {
+    const rows = this.db.prepare(`
+      SELECT day_key, rating, occurred_at
+      FROM training_rating_events
+      WHERE guild_id = ? AND discord_user_id = ? AND occurred_at >= ?
+      ORDER BY occurred_at ASC, day_key ASC
+    `).all(guildId, discordUserId, since) as Row[];
+    return rows.map((row) => ({
+      dayKey: String(row.day_key),
+      epochSecond: Number(row.occurred_at),
+      rating: Number(row.rating)
     }));
   }
 
@@ -358,6 +473,32 @@ export class DiscordBotStore implements CacheStore {
       CREATE INDEX IF NOT EXISTS ix_score_events_leaderboard
       ON score_events (guild_id, month_key, discord_user_id);
 
+      CREATE TABLE IF NOT EXISTS training_rating_events (
+        guild_id TEXT NOT NULL,
+        discord_user_id TEXT NOT NULL,
+        day_key TEXT NOT NULL,
+        rating INTEGER NOT NULL,
+        occurred_at INTEGER NOT NULL,
+        PRIMARY KEY (guild_id, discord_user_id, day_key)
+      );
+
+      CREATE INDEX IF NOT EXISTS ix_training_rating_events_history
+      ON training_rating_events (guild_id, discord_user_id, occurred_at);
+
+      CREATE TABLE IF NOT EXISTS pending_link_challenges (
+        guild_id TEXT NOT NULL,
+        discord_user_id TEXT NOT NULL,
+        atcoder_username TEXT NOT NULL,
+        problem_id TEXT NOT NULL,
+        contest_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        verification_type TEXT NOT NULL DEFAULT 'profile_code',
+        verification_code TEXT NOT NULL DEFAULT '',
+        issued_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (guild_id, discord_user_id)
+      );
+
       CREATE TABLE IF NOT EXISTS review_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         guild_id TEXT NOT NULL,
@@ -381,6 +522,14 @@ export class DiscordBotStore implements CacheStore {
         data TEXT NOT NULL
       );
     `);
+    this.addColumnIfMissing("pending_link_challenges", "verification_type", "TEXT NOT NULL DEFAULT 'profile_code'");
+    this.addColumnIfMissing("pending_link_challenges", "verification_code", "TEXT NOT NULL DEFAULT ''");
+  }
+
+  private addColumnIfMissing(table: string, column: string, definition: string): void {
+    const rows = this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[];
+    if (rows.some((row) => row.name === column)) return;
+    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 }
 
@@ -395,6 +544,18 @@ function linkedUserFromRow(row: Row): LinkedUser {
     atcoderUsername: String(row.atcoder_username),
     trainingRating: Number(row.training_rating),
     createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at)
+  };
+}
+
+function pendingLinkChallengeFromRow(row: Row): PendingLinkChallenge {
+  return {
+    guildId: String(row.guild_id),
+    discordUserId: String(row.discord_user_id),
+    atcoderUsername: String(row.atcoder_username),
+    verificationType: "profile_code",
+    verificationCode: String(row.verification_code ?? ""),
+    issuedAt: Number(row.issued_at),
     updatedAt: Number(row.updated_at)
   };
 }
@@ -432,4 +593,8 @@ function reviewItemFromRow(row: Row): ReviewQueueItem {
     createdAt: Number(row.created_at),
     consumedAt: row.consumed_at === null ? undefined : Number(row.consumed_at)
   };
+}
+
+function getUtcDayKey(epochSecond: number): string {
+  return new Date(epochSecond * 1000).toISOString().slice(0, 10);
 }

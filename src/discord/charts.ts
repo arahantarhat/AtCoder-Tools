@@ -156,20 +156,52 @@ export function renderBarChart(title: string, labels: string[], values: number[]
   return renderStackedBarChart(title, labels, [{ label: title, color, values }], false);
 }
 
+export async function renderHistogramChart(title: string, labels: string[], values: number[], colors: string[]): Promise<Buffer> {
+  return renderBarLikeChart(title, labels, [{
+    label: title,
+    data: values,
+    backgroundColor: colors,
+    borderColor: "rgba(255,255,255,0.75)",
+    borderWidth: 1
+  }], false, false);
+}
+
 export async function renderStackedBarChart(title: string, labels: string[], series: BarSeries[], showLegend = true): Promise<Buffer> {
+  return renderBarLikeChart(
+    title,
+    labels,
+    series.map((entry) => ({
+      label: entry.label,
+      data: entry.values,
+      backgroundColor: entry.color,
+      borderColor: "rgba(255,255,255,0.75)",
+      borderWidth: 1
+    })),
+    showLegend,
+    true
+  );
+}
+
+async function renderBarLikeChart(
+  title: string,
+  labels: string[],
+  datasets: Array<{
+    label: string;
+    data: number[];
+    backgroundColor: string | string[];
+    borderColor: string;
+    borderWidth: number;
+  }>,
+  showLegend: boolean,
+  stacked: boolean
+): Promise<Buffer> {
   const canvas = createCanvas(WIDTH, HEIGHT);
   const context = canvas.getContext("2d");
   const config: ChartConfiguration<"bar"> = {
     type: "bar",
     data: {
       labels,
-      datasets: series.map((entry) => ({
-        label: entry.label,
-        data: entry.values,
-        backgroundColor: entry.color,
-        borderColor: "rgba(255,255,255,0.75)",
-        borderWidth: 1
-      }))
+      datasets
     },
     options: {
       devicePixelRatio: 2,
@@ -181,13 +213,18 @@ export async function renderStackedBarChart(title: string, labels: string[], ser
       },
       scales: {
         x: {
-          stacked: true,
+          stacked,
           border: { color: AXIS },
           grid: { color: "rgba(255,255,255,0.32)" },
-          ticks: { color: TEXT }
+          ticks: {
+            color: TEXT,
+            autoSkip: labels.length > 16,
+            maxRotation: 45,
+            minRotation: labels.length > 12 ? 45 : 0
+          }
         },
         y: {
-          stacked: true,
+          stacked,
           beginAtZero: true,
           border: { color: AXIS },
           grid: { color: GRID },

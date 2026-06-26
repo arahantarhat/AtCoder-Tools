@@ -1,8 +1,11 @@
 import type { ContestType, ProblemRow } from "../types";
 
-export type AssignmentStatus = "active" | "completed" | "assisted" | "skipped";
+export type VerifiedAssignmentStatus = "completed" | "assisted" | "skipped";
+export type PendingVerificationStatus = "pending_completed" | "pending_assisted";
+export type AssignmentStatus = "active" | VerifiedAssignmentStatus | PendingVerificationStatus;
 export type AssignmentMode = "gimme" | "train" | "review";
 export type ReviewReason = "assisted" | "skipped";
+export type ScoreReason = "completed" | "assisted";
 
 export interface LinkedUser {
   guildId: string;
@@ -10,6 +13,16 @@ export interface LinkedUser {
   atcoderUsername: string;
   trainingRating: number;
   createdAt: number;
+  updatedAt: number;
+}
+
+export interface PendingLinkChallenge {
+  guildId: string;
+  discordUserId: string;
+  atcoderUsername: string;
+  verificationType: "profile_code";
+  verificationCode: string;
+  issuedAt: number;
   updatedAt: number;
 }
 
@@ -69,6 +82,12 @@ export interface MonthlyPoints {
 export interface LeaderboardTrendPoint extends MonthlyPoints {
   discordUserId: string;
   atcoderUsername?: string | undefined;
+}
+
+export interface TrainingRatingPoint {
+  dayKey: string;
+  epochSecond: number;
+  rating: number;
 }
 
 export interface ProblemFilters {
