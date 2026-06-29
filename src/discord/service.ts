@@ -11,6 +11,7 @@ import type { BotAssignment, LinkedUser, PendingLinkChallenge, ProblemFilters, S
 type TrainingOutcome = "completed" | "assisted" | "skipped";
 
 export type LinkUserResult =
+  | { status: "already_linked"; user: LinkedUser }
   | { status: "pending"; challenge: PendingLinkChallenge }
   | { status: "linked"; user: LinkedUser };
 
@@ -32,6 +33,9 @@ export class DiscordTrainingBotService {
   constructor(private readonly store: DiscordBotStore, private readonly atcoder: DiscordAtCoderService) {}
 
   async linkUser(guildId: string, discordUserId: string, username: string, now = nowSecond()): Promise<LinkUserResult> {
+    const linked = this.store.getLinkedUser(guildId, discordUserId);
+    if (linked) return { status: "already_linked", user: linked };
+
     const pending = this.store.getPendingLinkChallenge(guildId, discordUserId);
     if (pending?.atcoderUsername === username && pending.verificationCode) {
       const verified = await this.atcoder.hasProfileVerificationCode(username, pending.verificationCode);
@@ -117,11 +121,23 @@ export class DiscordTrainingBotService {
     guildId: string,
     discordUserId: string,
     outcome: TrainingOutcome,
-    now = nowSecond()
+    now = nowSecond(),
+    expectedAssignmentId?: number
   ): Promise<TrainingResolutionResult> {
     const user = this.store.getLinkedUserOrThrow(guildId, discordUserId);
     const assignment = this.store.getActiveAssignment(guildId, discordUserId);
-    if (!assignment) throw new Error("You do not have an active assignment.");
+    if (!assignment) {
+      const resolvedAssignment = expectedAssignmentId === undefined
+        ? this.store.getLatestAssignment(guildId, discordUserId)
+        : this.store.getAssignment(expectedAssignmentId);
+      if (resolvedAssignment && resolvedAssignment.guildId === guildId && resolvedAssignment.discordUserId === discordUserId) {
+        throw new Error(alreadyResolvedAssignmentMessage(resolvedAssignment));
+      }
+      throw new Error("You do not have an active assignment.");
+    }
+    if (expectedAssignmentId !== undefined && assignment.id !== expectedAssignmentId) {
+      throw new Error("That training button belongs to an older assignment. Use /train current for the active one.");
+    }
 
     if (outcome === "skipped") {
       this.store.resolveAssignment(assignment, outcome, now);
@@ -256,4 +272,23 @@ function outcomeFromPendingStatus(status: BotAssignment["status"]): ScoreReason 
   if (status === "pending_completed") return "completed";
   if (status === "pending_assisted") return "assisted";
   return null;
+}
+
+function alreadyResolvedAssignmentMessage(assignment: BotAssignment): string {
+  if (assignment.status === "pending_completed") {
+    return `${assignment.title}: completed claim already recorded and pending verification. No points or rating change have been applied yet. Use /train verify to check again.`;
+  }
+  if (assignment.status === "pending_assisted") {
+    return `${assignment.title}: assisted claim already recorded and pending verification. No points or rating change have been applied yet. Use /train verify to check again.`;
+  }
+  if (assignment.status === "completed") {
+    return `${assignment.title}: already completed. Points and training rating were already applied.`;
+  }
+  if (assignment.status === "assisted") {
+    return `${assignment.title}: already marked assisted. Points, review queue, and training rating were already applied.`;
+  }
+  if (assignment.status === "skipped") {
+    return `${assignment.title}: already skipped. Review queue and training rating were already updated.`;
+  }
+  return "You do not have an active assignment.";
 }

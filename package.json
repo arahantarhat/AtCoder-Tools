@@ -10,6 +10,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "bot:build": "node scripts/build-bot.mjs",
+    "bot:host": "npm run bot:build && node index.js",
     "bot:start": "npm run bot:build && node dist-discord/bot.cjs",
     "start": "npm run build && electron .",
     "dist:mac": "npm run check && electron-builder --mac dir --arm64",

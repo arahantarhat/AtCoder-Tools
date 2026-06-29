@@ -202,6 +202,16 @@ export class DiscordBotStore implements CacheStore {
     return row ? assignmentFromRow(row) : null;
   }
 
+  getLatestAssignment(guildId: string, discordUserId: string): BotAssignment | null {
+    const row = this.db.prepare(`
+      SELECT * FROM assignments
+      WHERE guild_id = ? AND discord_user_id = ?
+      ORDER BY assigned_at DESC, id DESC
+      LIMIT 1
+    `).get(guildId, discordUserId) as Row | undefined;
+    return row ? assignmentFromRow(row) : null;
+  }
+
   listPendingVerification(limit = 50): BotAssignment[] {
     const rows = this.db.prepare(`
       SELECT * FROM assignments

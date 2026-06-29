@@ -4,10 +4,8 @@ import { renderBarChart, renderHistogramChart, renderLineChart, type LineSeries 
 import { getUtcMonthKey } from "./time";
 import type { DiscordTrainingBotService } from "./service";
 import type { DiscordBotStore } from "./storage";
-import type { LeaderboardEntry } from "./types";
 
 const DAY_SECONDS = 24 * 60 * 60;
-const LINE_COLORS = ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c"];
 const GRAPH_RANGES: Record<string, { label: string; days?: number | undefined }> = {
   "30d": { label: "last 30 days", days: 30 },
   "90d": { label: "last 90 days", days: 90 },
@@ -36,7 +34,6 @@ export async function graphReply(
   if (subcommand === "official") return officialGraphReply(guildId, target, service, store, range);
   if (subcommand === "training") return trainingGraphReply(guildId, target, store, range);
   if (subcommand === "points") return pointsGraphReply(guildId, target, store, range, now);
-  if (subcommand === "leaderboard") return leaderboardGraphReply(guildId, store, range, now);
   if (subcommand === "solved") return solvedHistogramGraphReply(guildId, target, service, store);
   return { content: "Unknown graph." };
 }
@@ -121,20 +118,6 @@ async function pointsGraphReply(guildId: string, target: User, store: DiscordBot
   );
 }
 
-async function leaderboardGraphReply(guildId: string, store: DiscordBotStore, range: GraphRange, now: number): Promise<InteractionReplyOptions> {
-  const since = range.since ?? 0;
-  const leaders = store.getTopLeaderboardUsersSince(guildId, since, 5);
-  if (leaders.length === 0) return { content: `No leaderboard points found in ${range.label}.` };
-  const trend = store.getLeaderboardTrendSince(guildId, leaders.map((entry) => entry.discordUserId), since);
-  const months = monthKeysBetween(range.since ?? monthKeyToEpochSecond(trend[0]?.monthKey ?? getUtcMonthKey(now)), now);
-  const series = leaders.map((leader, index) => cumulativeSeries(leader, index, months, trend));
-  return attachmentReply(
-    "Server leaderboard trend",
-    "leaderboard-trend.png",
-    await renderLineChart("Server leaderboard trend", series, months)
-  );
-}
-
 async function solvedHistogramGraphReply(
   guildId: string,
   target: User,
@@ -154,24 +137,6 @@ async function solvedHistogramGraphReply(
       bins.map((bin) => difficultyColor(bin.start))
     )
   );
-}
-
-function cumulativeSeries(
-  leader: LeaderboardEntry,
-  index: number,
-  months: string[],
-  trend: Array<{ discordUserId: string; monthKey: string; points: number }>
-): LineSeries {
-  const monthly = new Map(trend.filter((point) => point.discordUserId === leader.discordUserId).map((point) => [point.monthKey, point.points]));
-  let total = 0;
-  return {
-    label: leader.atcoderUsername ?? leader.discordUserId,
-    color: LINE_COLORS[index % LINE_COLORS.length] ?? "#2563eb",
-    points: months.map((month, monthIndex) => {
-      total += monthly.get(month) ?? 0;
-      return { x: monthIndex, y: total, label: `${leader.atcoderUsername ?? leader.discordUserId}: ${total} pts` };
-    })
-  };
 }
 
 function attachmentReply(content: string, name: string, png: Buffer): InteractionReplyOptions {

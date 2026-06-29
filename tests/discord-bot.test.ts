@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { renderLineChart, renderStackedBarChart } from "../src/discord/charts";
-import { buildDiscordCommands } from "../src/discord/commands";
+import { buildDiscordCommands, handleInteraction, shouldReplyEphemerally, trainingResolutionMessage } from "../src/discord/commands";
 import { graphReply } from "../src/discord/graphs";
+import { graphsHelpMessage, leaderboardMessage, trainingHelpMessage } from "../src/discord/messages";
 import { selectRandomProblem, selectTrainingProblem } from "../src/discord/problem-selection";
 import { pointsForDelta, reviewDelaySeconds, updateTrainingRating } from "../src/discord/scoring";
 import { DiscordTrainingBotService } from "../src/discord/service";
@@ -260,6 +261,20 @@ describe("Discord bot service", () => {
     store.close();
   });
 
+  it("does not start a new link challenge for an already linked user", async () => {
+    const store = new DiscordBotStore(":memory:");
+    const service = new DiscordTrainingBotService(store, fakeAtCoder(true));
+    await linkForTest(service, "guild", "1", "tourist", 1_700_000_000);
+
+    const result = await service.linkUser("guild", "1", "benq", 1_700_000_120);
+
+    expect(result.status).toBe("already_linked");
+    expect(result.status === "already_linked" ? result.user.atcoderUsername : null).toBe("tourist");
+    expect(store.getPendingLinkChallenge("guild", "1")).toBeNull();
+    expect(store.getLinkedUserOrThrow("guild", "1").atcoderUsername).toBe("tourist");
+    store.close();
+  });
+
   it("awards points after verified AC and queues assisted reviews", async () => {
     const store = new DiscordBotStore(":memory:");
     const service = new DiscordTrainingBotService(store, fakeAtCoder(true));
@@ -302,6 +317,59 @@ describe("Discord bot service", () => {
     store.close();
   });
 
+  it("explains pending verification after an unverified completion claim", async () => {
+    const store = new DiscordBotStore(":memory:");
+    const service = new DiscordTrainingBotService(store, fakeAtCoder(false));
+    await linkForTest(service, "guild", "1", "tourist", 1_700_000_000);
+    await service.startTraining("guild", "1", 0, 1_700_000_100);
+
+    const result = await service.resolveTraining("guild", "1", "completed", 1_700_000_200);
+    const message = trainingResolutionMessage(result);
+
+    expect(message).toContain("pending verification");
+    expect(message).toContain("/train verify");
+    expect(message).toContain("/train status");
+    store.close();
+  });
+
+  it("reports an already recorded completion claim when /train completed is repeated", async () => {
+    const store = new DiscordBotStore(":memory:");
+    const service = new DiscordTrainingBotService(store, fakeAtCoder(false));
+    await linkForTest(service, "guild", "1", "tourist", 1_700_000_000);
+    await service.startTraining("guild", "1", 0, 1_700_000_100);
+    await service.resolveTraining("guild", "1", "completed", 1_700_000_200);
+
+    await expect(service.resolveTraining("guild", "1", "completed", 1_700_000_240))
+      .rejects.toThrow(/completed claim already recorded and pending verification/);
+    store.close();
+  });
+
+  it("reports an already recorded completion claim when the Completed button is pressed again", async () => {
+    const store = new DiscordBotStore(":memory:");
+    const service = new DiscordTrainingBotService(store, fakeAtCoder(false));
+    await linkForTest(service, "guild", "1", "tourist", 1_700_000_000);
+    const assignment = await service.startTraining("guild", "1", 0, 1_700_000_100);
+    await service.resolveTraining("guild", "1", "completed", 1_700_000_200, assignment.id);
+
+    await expect(service.resolveTraining("guild", "1", "completed", 1_700_000_240, assignment.id))
+      .rejects.toThrow(/completed claim already recorded and pending verification/);
+    store.close();
+  });
+
+  it("rejects stale training button assignment ids", async () => {
+    const store = new DiscordBotStore(":memory:");
+    const service = new DiscordTrainingBotService(store, fakeAtCoder(false));
+    await linkForTest(service, "guild", "1", "tourist", 1_700_000_000);
+    const first = await service.startTraining("guild", "1", 0, 1_700_000_100);
+    await service.resolveTraining("guild", "1", "completed", 1_700_000_200, first.id);
+    const second = await service.startTraining("guild", "1", 300, 1_700_000_300);
+
+    await expect(service.resolveTraining("guild", "1", "completed", 1_700_000_400, first.id))
+      .rejects.toThrow(/older assignment/);
+    expect(store.getActiveAssignment("guild", "1")?.id).toBe(second.id);
+    store.close();
+  });
+
   it("awards pending completion points after later public verification", async () => {
     let solved = false;
     const store = new DiscordBotStore(":memory:");
@@ -324,25 +392,146 @@ describe("Discord bot service", () => {
 
   it("exposes the V1 slash commands including help", () => {
     const commands = buildDiscordCommands();
-    expect(commands.map((command) => command.name)).toEqual([
+    expect(commands.map((command) => command.name)).toEqual(["help", "link", "gimme", "train", "graphs"]);
+    const gimme = commands.find((command) => command.name === "gimme");
+    expect(gimme?.options?.map((option) => option.name)).toEqual(["min", "max", "color", "unsolved_only"]);
+    const train = commands.find((command) => command.name === "train");
+    expect(train?.options?.map((option) => option.name)).toEqual([
       "help",
-      "link",
-      "gimme",
-      "train",
+      "start",
+      "current",
+      "completed",
+      "assisted",
+      "skip",
+      "verify",
+      "status",
       "queue",
-      "leaderboard",
-      "points",
-      "profile",
-      "graph"
+      "review",
+      "leaderboard"
     ]);
-    const graph = commands.find((command) => command.name === "graph");
-    expect(graph?.options?.map((option) => option.name)).toEqual(["official", "training", "points", "solved", "leaderboard"]);
-    for (const subcommand of graph?.options ?? []) {
-      if (subcommand.name === "solved") continue;
+    const status = train?.options?.find((option) => option.name === "status");
+    const statusOptions = status && "options" in status ? status.options : undefined;
+    expect(statusOptions?.map((option) => option.name)).toEqual(["user"]);
+    const leaderboard = train?.options?.find((option) => option.name === "leaderboard");
+    const leaderboardOptions = leaderboard && "options" in leaderboard ? leaderboard.options : undefined;
+    expect(leaderboardOptions?.map((option) => option.name)).toEqual(["month", "period"]);
+    const graphs = commands.find((command) => command.name === "graphs");
+    expect(graphs?.options?.map((option) => option.name)).toEqual(["help", "official", "training", "points", "solved"]);
+    for (const subcommand of graphs?.options ?? []) {
+      if (subcommand.name === "help" || subcommand.name === "solved") continue;
       const options = "options" in subcommand ? subcommand.options : undefined;
       const range = options?.find((option) => option.name === "range");
       expect(range && "choices" in range ? range.choices?.map((choice) => choice.value) : undefined).toEqual(["30d", "90d", "6m", "1y", "full"]);
     }
+  });
+
+  it("keeps requested personal Discord surfaces ephemeral while public progress remains public", () => {
+    expect(shouldReplyEphemerally("gimme")).toBe(true);
+    expect(shouldReplyEphemerally("link")).toBe(true);
+    expect(shouldReplyEphemerally("train", "help")).toBe(true);
+    expect(shouldReplyEphemerally("train", "start")).toBe(true);
+    expect(shouldReplyEphemerally("train", "current")).toBe(true);
+    expect(shouldReplyEphemerally("train", "completed")).toBe(true);
+    expect(shouldReplyEphemerally("train", "assisted")).toBe(true);
+    expect(shouldReplyEphemerally("train", "skip")).toBe(true);
+    expect(shouldReplyEphemerally("train", "verify")).toBe(true);
+    expect(shouldReplyEphemerally("train", "queue")).toBe(true);
+    expect(shouldReplyEphemerally("train", "review")).toBe(true);
+
+    expect(shouldReplyEphemerally("train", "status")).toBe(false);
+    expect(shouldReplyEphemerally("train", "leaderboard")).toBe(false);
+    expect(shouldReplyEphemerally("graphs", "help")).toBe(true);
+    expect(shouldReplyEphemerally("graphs", "training")).toBe(false);
+  });
+
+  it("defers slow slash commands before running service work", async () => {
+    const events: string[] = [];
+    const service = {
+      gimme: async () => {
+        events.push("service");
+        return {
+          id: 0,
+          guildId: "guild",
+          discordUserId: "1",
+          atcoderUsername: "tourist",
+          mode: "gimme",
+          problemId: "abc250_c",
+          contestId: "abc250",
+          title: "Green",
+          difficulty: 900,
+          targetDelta: 0,
+          points: 0,
+          status: "active",
+          assignedAt: 1
+        };
+      }
+    } as unknown as DiscordTrainingBotService;
+    const interaction = fakeChatInputInteraction("gimme", null, events);
+
+    await handleInteraction(interaction, service, {} as DiscordBotStore);
+
+    expect(events).toEqual(["defer:true", "service", "edit"]);
+  });
+
+  it("defers training buttons before resolving assignments", async () => {
+    const events: string[] = [];
+    const service = {
+      resolveTraining: async () => {
+        events.push("service");
+        return {
+          assignment: {
+            id: 1,
+            guildId: "guild",
+            discordUserId: "1",
+            atcoderUsername: "tourist",
+            mode: "train",
+            problemId: "abc250_c",
+            contestId: "abc250",
+            title: "Green",
+            difficulty: 900,
+            targetDelta: 0,
+            points: 8,
+            status: "active",
+            assignedAt: 1
+          },
+          outcome: "completed",
+          verification: "verified",
+          points: 8,
+          rating: 1220
+        };
+      }
+    } as unknown as DiscordTrainingBotService;
+    const interaction = fakeButtonInteraction("train:completed:1", events);
+
+    await handleInteraction(interaction, service, {} as DiscordBotStore);
+
+    expect(events).toEqual(["defer:true", "service", "edit"]);
+  });
+
+  it("renders the server leaderboard as a ranked table", () => {
+    const message = leaderboardMessage([
+      { discordUserId: "1", atcoderUsername: "tourist", points: 1939 },
+      { discordUserId: "2", atcoderUsername: "benq", points: 978 }
+    ], "2026-06");
+
+    expect(message).toContain("**Training leaderboard - 2026-06**");
+    expect(message).toContain("#  Name  Handle   Points");
+    expect(message).toContain("1  <@1>  tourist    1939");
+    expect(message).toContain("2  <@2>  benq        978");
+  });
+
+  it("explains training and graph modules in detailed help messages", () => {
+    const trainingHelp = trainingHelpMessage();
+    const graphHelp = graphsHelpMessage();
+
+    expect(trainingHelp).toContain("`/train start [delta]`");
+    expect(trainingHelp).toContain("Completed");
+    expect(trainingHelp).toContain("AC");
+    expect(trainingHelp).toContain("`/train leaderboard [period] [month]`");
+    expect(graphHelp).toContain("`/graphs official [user] [range]`");
+    expect(graphHelp).toContain("daily training ELO");
+    expect(graphHelp).toContain("verified points");
+    expect(graphHelp).not.toContain("`/graph ...` still works");
   });
 
   it("builds official graph replies and empty graph responses", async () => {
@@ -448,4 +637,67 @@ function fakeAtCoder(solved: boolean | (() => boolean), history: OfficialRatingP
 
 function fakeUser(id: string) {
   return { id } as Parameters<typeof graphReply>[1];
+}
+
+function fakeChatInputInteraction(commandName: string, subcommand: string | null, events: string[]) {
+  const fake = {
+    commandName,
+    guildId: "guild",
+    user: { id: "1" },
+    deferred: false,
+    replied: false,
+    isButton: () => false,
+    isChatInputCommand: () => true,
+    options: {
+      getSubcommand: () => subcommand,
+      getString: () => null,
+      getInteger: () => null,
+      getBoolean: () => null,
+      getUser: () => null
+    },
+    deferReply: async (options: { ephemeral?: boolean }) => {
+      events.push(`defer:${options.ephemeral === true}`);
+      fake.deferred = true;
+    },
+    editReply: async () => {
+      events.push("edit");
+      fake.replied = true;
+    },
+    reply: async () => {
+      events.push("reply");
+      fake.replied = true;
+    },
+    followUp: async () => {
+      events.push("followUp");
+    }
+  };
+  return fake as unknown as Parameters<typeof handleInteraction>[0];
+}
+
+function fakeButtonInteraction(customId: string, events: string[]) {
+  const fake = {
+    customId,
+    guildId: "guild",
+    user: { id: "1" },
+    deferred: false,
+    replied: false,
+    isButton: () => true,
+    isChatInputCommand: () => false,
+    deferReply: async (options: { ephemeral?: boolean }) => {
+      events.push(`defer:${options.ephemeral === true}`);
+      fake.deferred = true;
+    },
+    editReply: async () => {
+      events.push("edit");
+      fake.replied = true;
+    },
+    reply: async () => {
+      events.push("reply");
+      fake.replied = true;
+    },
+    followUp: async () => {
+      events.push("followUp");
+    }
+  };
+  return fake as unknown as Parameters<typeof handleInteraction>[0];
 }
