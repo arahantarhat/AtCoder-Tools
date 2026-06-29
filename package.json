@@ -10,6 +10,9 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "bot:build": "node scripts/build-bot.mjs",
+    "bot:clear-commands:global": "node scripts/clear-discord-commands.mjs global",
+    "bot:clear-commands:guild": "node scripts/clear-discord-commands.mjs guild",
+    "bot:clear-commands:both": "node scripts/clear-discord-commands.mjs both",
     "bot:host": "npm run bot:build && node index.js",
     "bot:start": "npm run bot:build && node dist-discord/bot.cjs",
     "start": "npm run build && electron .",

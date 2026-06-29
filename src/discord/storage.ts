@@ -7,6 +7,8 @@ import type {
   AssignmentMode,
   AssignmentStatus,
   BotAssignment,
+  Duel,
+  DuelProfile,
   LeaderboardEntry,
   LeaderboardTrendPoint,
   LinkedUser,
@@ -17,6 +19,7 @@ import type {
   ReviewReason,
   TrainingRatingPoint
 } from "./types";
+import { calculateDuelElo, type DuelCompletion } from "./duels";
 
 type Row = Record<string, unknown>;
 const require = createRequire(`${process.cwd()}/package.json`);
@@ -437,6 +440,262 @@ export class DiscordBotStore implements CacheStore {
     this.db.prepare("UPDATE review_queue SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL").run(now, id);
   }
 
+  getDuelProfile(guildId: string, discordUserId: string): DuelProfile | null {
+    const row = this.db.prepare("SELECT * FROM duel_profiles WHERE guild_id = ? AND discord_user_id = ?")
+      .get(guildId, discordUserId) as Row | undefined;
+    return row ? duelProfileFromRow(row) : null;
+  }
+
+  upsertDuelProfile(input: {
+    guildId: string;
+    discordUserId: string;
+    atcoderUsername: string;
+    initialRating: number;
+    now: number;
+  }): DuelProfile {
+    const existing = this.getDuelProfile(input.guildId, input.discordUserId);
+    const rating = existing?.duelRating ?? input.initialRating;
+    this.db.prepare(`
+      INSERT INTO duel_profiles (guild_id, discord_user_id, atcoder_username, duel_rating, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(guild_id, discord_user_id) DO UPDATE SET
+        atcoder_username = excluded.atcoder_username,
+        updated_at = excluded.updated_at
+    `).run(
+      input.guildId,
+      input.discordUserId,
+      input.atcoderUsername,
+      rating,
+      existing?.createdAt ?? input.now,
+      input.now
+    );
+    return this.getDuelProfile(input.guildId, input.discordUserId)!;
+  }
+
+  createPendingDuel(input: {
+    guildId: string;
+    challengerUserId: string;
+    targetUserId: string;
+    challengedAt: number;
+    expiresAt: number;
+  }): Duel {
+    const result = this.db.prepare(`
+      INSERT INTO duels (guild_id, challenger_user_id, target_user_id, status, challenged_at, expires_at)
+      VALUES (?, ?, ?, 'pending', ?, ?)
+    `).run(input.guildId, input.challengerUserId, input.targetUserId, input.challengedAt, input.expiresAt);
+    return this.getDuel(Number(result.lastInsertRowid))!;
+  }
+
+  getDuel(id: number): Duel | null {
+    const row = this.db.prepare("SELECT * FROM duels WHERE id = ?").get(id) as Row | undefined;
+    return row ? duelFromRow(row) : null;
+  }
+
+  findDuplicatePendingDuel(guildId: string, firstUserId: string, secondUserId: string, now: number): Duel | null {
+    const row = this.db.prepare(`
+      SELECT * FROM duels
+      WHERE guild_id = ?
+        AND status = 'pending'
+        AND expires_at > ?
+        AND (
+          (challenger_user_id = ? AND target_user_id = ?)
+          OR (challenger_user_id = ? AND target_user_id = ?)
+        )
+      ORDER BY challenged_at ASC, id ASC
+      LIMIT 1
+    `).get(guildId, now, firstUserId, secondUserId, secondUserId, firstUserId) as Row | undefined;
+    return row ? duelFromRow(row) : null;
+  }
+
+  getActiveDuelForUser(guildId: string, discordUserId: string): Duel | null {
+    const row = this.db.prepare(`
+      SELECT * FROM duels
+      WHERE guild_id = ?
+        AND status = 'active'
+        AND (challenger_user_id = ? OR target_user_id = ?)
+      ORDER BY accepted_at DESC, id DESC
+      LIMIT 1
+    `).get(guildId, discordUserId, discordUserId) as Row | undefined;
+    return row ? duelFromRow(row) : null;
+  }
+
+  getActiveDuelConflict(guildId: string, firstUserId: string, secondUserId: string): Duel | null {
+    const row = this.db.prepare(`
+      SELECT * FROM duels
+      WHERE guild_id = ?
+        AND status = 'active'
+        AND (
+          challenger_user_id IN (?, ?)
+          OR target_user_id IN (?, ?)
+        )
+      ORDER BY accepted_at DESC, id DESC
+      LIMIT 1
+    `).get(guildId, firstUserId, secondUserId, firstUserId, secondUserId) as Row | undefined;
+    return row ? duelFromRow(row) : null;
+  }
+
+  listPendingDuelsForUser(guildId: string, discordUserId: string, now: number): { sent: Duel[]; received: Duel[] } {
+    const rows = this.db.prepare(`
+      SELECT * FROM duels
+      WHERE guild_id = ?
+        AND status = 'pending'
+        AND expires_at > ?
+        AND (challenger_user_id = ? OR target_user_id = ?)
+      ORDER BY challenged_at ASC, id ASC
+    `).all(guildId, now, discordUserId, discordUserId) as Row[];
+    const duels = rows.map(duelFromRow);
+    return {
+      sent: duels.filter((duel) => duel.challengerUserId === discordUserId),
+      received: duels.filter((duel) => duel.targetUserId === discordUserId)
+    };
+  }
+
+  getOldestReceivedPendingDuel(guildId: string, discordUserId: string, now: number): Duel | null {
+    const row = this.db.prepare(`
+      SELECT * FROM duels
+      WHERE guild_id = ?
+        AND status = 'pending'
+        AND target_user_id = ?
+        AND expires_at > ?
+      ORDER BY challenged_at ASC, id ASC
+      LIMIT 1
+    `).get(guildId, discordUserId, now) as Row | undefined;
+    return row ? duelFromRow(row) : null;
+  }
+
+  expireStaleDuels(now: number): void {
+    this.db.prepare("UPDATE duels SET status = 'expired', expired_at = ? WHERE status = 'pending' AND expires_at <= ?")
+      .run(now, now);
+  }
+
+  acceptDuel(input: {
+    duelId: number;
+    challengerHandle: string;
+    targetHandle: string;
+    problemId: string;
+    contestId: string;
+    title: string;
+    difficulty: number;
+    challengerRating: number;
+    targetRating: number;
+    lowerRatedUserId: string;
+    higherRatedUserId: string;
+    handicapCoefficient: number;
+    acceptedAt: number;
+    expiresAt: number;
+  }): Duel | null {
+    const result = this.db.prepare(`
+      UPDATE duels
+      SET status = 'active',
+        challenger_handle = ?,
+        target_handle = ?,
+        problem_id = ?,
+        contest_id = ?,
+        title = ?,
+        difficulty = ?,
+        accepted_at = ?,
+        expires_at = ?,
+        handicap_coefficient = ?,
+        lower_rated_user_id = ?,
+        higher_rated_user_id = ?,
+        challenger_rating_before = ?,
+        target_rating_before = ?
+      WHERE id = ? AND status = 'pending'
+    `).run(
+      input.challengerHandle,
+      input.targetHandle,
+      input.problemId,
+      input.contestId,
+      input.title,
+      input.difficulty,
+      input.acceptedAt,
+      input.expiresAt,
+      input.handicapCoefficient,
+      input.lowerRatedUserId,
+      input.higherRatedUserId,
+      input.challengerRating,
+      input.targetRating,
+      input.duelId
+    );
+    return result.changes > 0 ? this.getDuel(input.duelId) : null;
+  }
+
+  declineDuel(duelId: number, now: number): Duel | null {
+    const result = this.db.prepare("UPDATE duels SET status = 'declined', declined_at = ? WHERE id = ? AND status = 'pending'")
+      .run(now, duelId);
+    return result.changes > 0 ? this.getDuel(duelId) : null;
+  }
+
+  completeDuel(input: {
+    duel: Duel;
+    completion: DuelCompletion;
+    now: number;
+  }): Duel | null {
+    if (input.duel.challengerRatingBefore === undefined || input.duel.targetRatingBefore === undefined) {
+      throw new Error("Duel rating snapshot is missing.");
+    }
+    const elo = calculateDuelElo(input.duel.challengerRatingBefore, input.duel.targetRatingBefore, input.completion.challengerScore);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.db.prepare(`
+        UPDATE duels
+        SET status = 'completed',
+          completed_at = ?,
+          result = ?,
+          winner_user_id = ?,
+          challenger_solved_at = ?,
+          target_solved_at = ?,
+          challenger_rating_after = ?,
+          target_rating_after = ?,
+          challenger_delta = ?,
+          target_delta = ?
+        WHERE id = ? AND status = 'active'
+      `).run(
+        input.now,
+        input.completion.result,
+        input.completion.winnerUserId ?? null,
+        input.completion.challengerSolvedAt ?? null,
+        input.completion.targetSolvedAt ?? null,
+        elo.ratingAAfter,
+        elo.ratingBAfter,
+        elo.deltaA,
+        elo.deltaB,
+        input.duel.id
+      );
+      if (result.changes === 0) {
+        this.db.exec("ROLLBACK");
+        return this.getDuel(input.duel.id);
+      }
+      this.db.prepare("UPDATE duel_profiles SET duel_rating = ?, updated_at = ? WHERE guild_id = ? AND discord_user_id = ?")
+        .run(elo.ratingAAfter, input.now, input.duel.guildId, input.duel.challengerUserId);
+      this.db.prepare("UPDATE duel_profiles SET duel_rating = ?, updated_at = ? WHERE guild_id = ? AND discord_user_id = ?")
+        .run(elo.ratingBAfter, input.now, input.duel.guildId, input.duel.targetUserId);
+      this.db.exec("COMMIT");
+      return this.getDuel(input.duel.id);
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  expireDuel(duelId: number, now: number): Duel | null {
+    const result = this.db.prepare("UPDATE duels SET status = 'expired', expired_at = ?, result = 'expired' WHERE id = ? AND status IN ('pending', 'active')")
+      .run(now, duelId);
+    return result.changes > 0 ? this.getDuel(duelId) : this.getDuel(duelId);
+  }
+
+  listCompletedDuelsForUser(guildId: string, discordUserId: string, limit = 10): Duel[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM duels
+      WHERE guild_id = ?
+        AND status = 'completed'
+        AND (challenger_user_id = ? OR target_user_id = ?)
+      ORDER BY completed_at DESC, id DESC
+      LIMIT ?
+    `).all(guildId, discordUserId, discordUserId, limit) as Row[];
+    return rows.map(duelFromRow);
+  }
+
   private migrate(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS linked_users (
@@ -494,6 +753,56 @@ export class DiscordBotStore implements CacheStore {
 
       CREATE INDEX IF NOT EXISTS ix_training_rating_events_history
       ON training_rating_events (guild_id, discord_user_id, occurred_at);
+
+      CREATE TABLE IF NOT EXISTS duel_profiles (
+        guild_id TEXT NOT NULL,
+        discord_user_id TEXT NOT NULL,
+        atcoder_username TEXT NOT NULL,
+        duel_rating INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (guild_id, discord_user_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS duels (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT NOT NULL,
+        challenger_user_id TEXT NOT NULL,
+        target_user_id TEXT NOT NULL,
+        challenger_handle TEXT,
+        target_handle TEXT,
+        problem_id TEXT,
+        contest_id TEXT,
+        title TEXT,
+        difficulty INTEGER,
+        status TEXT NOT NULL,
+        challenged_at INTEGER NOT NULL,
+        accepted_at INTEGER,
+        expires_at INTEGER,
+        completed_at INTEGER,
+        declined_at INTEGER,
+        cancelled_at INTEGER,
+        expired_at INTEGER,
+        handicap_coefficient REAL,
+        lower_rated_user_id TEXT,
+        higher_rated_user_id TEXT,
+        challenger_rating_before INTEGER,
+        target_rating_before INTEGER,
+        challenger_rating_after INTEGER,
+        target_rating_after INTEGER,
+        challenger_delta INTEGER,
+        target_delta INTEGER,
+        result TEXT,
+        winner_user_id TEXT,
+        challenger_solved_at INTEGER,
+        target_solved_at INTEGER
+      );
+
+      CREATE INDEX IF NOT EXISTS ix_duels_user_status
+      ON duels (guild_id, status, challenger_user_id, target_user_id);
+
+      CREATE INDEX IF NOT EXISTS ix_duels_history
+      ON duels (guild_id, status, completed_at);
 
       CREATE TABLE IF NOT EXISTS pending_link_challenges (
         guild_id TEXT NOT NULL,
@@ -605,6 +914,61 @@ function reviewItemFromRow(row: Row): ReviewQueueItem {
   };
 }
 
+function duelProfileFromRow(row: Row): DuelProfile {
+  return {
+    guildId: String(row.guild_id),
+    discordUserId: String(row.discord_user_id),
+    atcoderUsername: String(row.atcoder_username),
+    duelRating: Number(row.duel_rating),
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at)
+  };
+}
+
+function duelFromRow(row: Row): Duel {
+  return {
+    id: Number(row.id),
+    guildId: String(row.guild_id),
+    challengerUserId: String(row.challenger_user_id),
+    targetUserId: String(row.target_user_id),
+    challengerHandle: optionalString(row.challenger_handle),
+    targetHandle: optionalString(row.target_handle),
+    problemId: optionalString(row.problem_id),
+    contestId: optionalString(row.contest_id),
+    title: optionalString(row.title),
+    difficulty: optionalNumber(row.difficulty),
+    status: String(row.status) as Duel["status"],
+    challengedAt: Number(row.challenged_at),
+    acceptedAt: optionalNumber(row.accepted_at),
+    expiresAt: optionalNumber(row.expires_at),
+    completedAt: optionalNumber(row.completed_at),
+    declinedAt: optionalNumber(row.declined_at),
+    cancelledAt: optionalNumber(row.cancelled_at),
+    expiredAt: optionalNumber(row.expired_at),
+    handicapCoefficient: optionalNumber(row.handicap_coefficient),
+    lowerRatedUserId: optionalString(row.lower_rated_user_id),
+    higherRatedUserId: optionalString(row.higher_rated_user_id),
+    challengerRatingBefore: optionalNumber(row.challenger_rating_before),
+    targetRatingBefore: optionalNumber(row.target_rating_before),
+    challengerRatingAfter: optionalNumber(row.challenger_rating_after),
+    targetRatingAfter: optionalNumber(row.target_rating_after),
+    challengerDelta: optionalNumber(row.challenger_delta),
+    targetDelta: optionalNumber(row.target_delta),
+    result: optionalString(row.result) as Duel["result"],
+    winnerUserId: optionalString(row.winner_user_id),
+    challengerSolvedAt: optionalNumber(row.challenger_solved_at),
+    targetSolvedAt: optionalNumber(row.target_solved_at)
+  };
+}
+
 function getUtcDayKey(epochSecond: number): string {
   return new Date(epochSecond * 1000).toISOString().slice(0, 10);
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  return value === null || value === undefined ? undefined : Number(value);
 }

@@ -1,7 +1,8 @@
 import type { APIEmbed, ActionRowData, ButtonComponentData, MessageActionRowComponentData } from "discord.js";
 import { ButtonStyle, ComponentType } from "discord-api-types/v10";
 import { formatDate } from "./time";
-import type { BotAssignment, LeaderboardEntry, LinkedUser, ReviewQueueItem } from "./types";
+import { duelResultLabel } from "./duels";
+import type { BotAssignment, Duel, LeaderboardEntry, LinkedUser, ReviewQueueItem } from "./types";
 
 export function helpMessage(): string {
   return [
@@ -12,7 +13,8 @@ export function helpMessage(): string {
     "4. Use Completed, Assisted, or Skip buttons. Completion points are awarded after public AC verification.",
     "5. Use `/train verify` to retry pending completion checks.",
     "6. `/train queue` reviews assisted/skipped problems later, and `/train review` starts the next due review.",
-    "7. Use `/train status`, `/train leaderboard`, and `/graphs` to show progress."
+    "7. Use `/duel` to challenge linked server members.",
+    "8. Use `/train status`, `/train leaderboard`, and `/graphs` to show progress."
   ].join("\n");
 }
 
@@ -78,6 +80,83 @@ export function trainingButtons(assignmentId: number): ActionRowData<MessageActi
   };
 }
 
+export function duelButtons(duelId: number): ActionRowData<MessageActionRowComponentData> {
+  return {
+    type: ComponentType.ActionRow,
+    components: [
+      button(`duel:accept:${duelId}`, "Accept", ButtonStyle.Success),
+      button(`duel:deny:${duelId}`, "Deny", ButtonStyle.Danger)
+    ]
+  };
+}
+
+export function duelEmbed(duel: Duel): APIEmbed {
+  const embed: APIEmbed = {
+    title: duel.title ?? "AtCoder duel",
+    description: duel.contestId && duel.problemId ? `${duel.contestId} / ${duel.problemId}` : "Problem hidden until the duel is accepted.",
+    fields: [
+      { name: "Challenger", value: `<@${duel.challengerUserId}>`, inline: true },
+      { name: "Opponent", value: `<@${duel.targetUserId}>`, inline: true },
+      { name: "Difficulty", value: duel.difficulty === undefined ? "-" : String(duel.difficulty), inline: true },
+      { name: "Challenger rating", value: duel.challengerRatingBefore === undefined ? "-" : String(duel.challengerRatingBefore), inline: true },
+      { name: "Opponent rating", value: duel.targetRatingBefore === undefined ? "-" : String(duel.targetRatingBefore), inline: true },
+      { name: "Handicap", value: duel.handicapCoefficient === undefined ? "-" : duel.handicapCoefficient.toFixed(3), inline: true }
+    ]
+  };
+  if (duel.contestId && duel.problemId) embed.url = problemUrl(duel.contestId, duel.problemId);
+  return embed;
+}
+
+export function duelChallengeMessage(duel: Duel): string {
+  return `<@${duel.targetUserId}>, <@${duel.challengerUserId}> challenged you to an AtCoder duel. Accept within 15 minutes.`;
+}
+
+export function duelAcceptedMessage(duel: Duel): string {
+  return `Duel accepted: <@${duel.challengerUserId}> vs <@${duel.targetUserId}>. First solve wins after handicap adjustment.`;
+}
+
+export function duelDeniedMessage(duel: Duel): string {
+  return `Duel challenge declined: <@${duel.challengerUserId}> vs <@${duel.targetUserId}>.`;
+}
+
+export function duelStatusMessage(duel: Duel, detail: string): string {
+  const expires = duel.expiresAt ? `Expires ${formatDate(duel.expiresAt)}.` : "";
+  return [
+    `Active duel: <@${duel.challengerUserId}> vs <@${duel.targetUserId}>`,
+    duel.title && duel.contestId && duel.problemId ? `[${duel.title}](${problemUrl(duel.contestId, duel.problemId)}) (${duel.difficulty})` : "Problem unavailable.",
+    `Ratings: ${duel.challengerRatingBefore ?? "-"} vs ${duel.targetRatingBefore ?? "-"}. Handicap coefficient: ${duel.handicapCoefficient?.toFixed(3) ?? "-"}.`,
+    detail,
+    expires
+  ].filter(Boolean).join("\n");
+}
+
+export function duelPendingMessage(sent: Duel[], received: Duel[]): string {
+  if (sent.length === 0 && received.length === 0) return "You have no active duel and no pending duel challenges.";
+  const lines = ["No active duel."];
+  if (received.length > 0) {
+    lines.push("Received:");
+    lines.push(...received.map((duel) => `#${duel.id} from <@${duel.challengerUserId}> expires ${duel.expiresAt ? formatDate(duel.expiresAt) : "soon"}`));
+  }
+  if (sent.length > 0) {
+    lines.push("Sent:");
+    lines.push(...sent.map((duel) => `#${duel.id} to <@${duel.targetUserId}> expires ${duel.expiresAt ? formatDate(duel.expiresAt) : "soon"}`));
+  }
+  return lines.join("\n");
+}
+
+export function duelHistoryMessage(duels: Duel[], userId: string): string {
+  if (duels.length === 0) return "No completed duels recorded.";
+  return duels.map((duel) => {
+    const opponentId = duel.challengerUserId === userId ? duel.targetUserId : duel.challengerUserId;
+    const before = duel.challengerUserId === userId ? duel.challengerRatingBefore : duel.targetRatingBefore;
+    const after = duel.challengerUserId === userId ? duel.challengerRatingAfter : duel.targetRatingAfter;
+    const delta = duel.challengerUserId === userId ? duel.challengerDelta : duel.targetDelta;
+    const outcome = duelResultLabel(duel.result, userId, duel.winnerUserId);
+    const problem = duel.contestId && duel.problemId && duel.title ? `[${duel.title}](${problemUrl(duel.contestId, duel.problemId)})` : duel.title ?? "Unknown problem";
+    return `${formatDate(duel.completedAt ?? duel.challengedAt)} - ${outcome} vs <@${opponentId}> on ${problem}: ${before ?? "-"} -> ${after ?? "-"} (${formatDelta(delta)})`;
+  }).join("\n");
+}
+
 export function leaderboardMessage(entries: LeaderboardEntry[], label: string): string {
   if (entries.length === 0) return `No points recorded for ${label}.`;
   const rows = entries.map((entry, index) => ({
@@ -131,4 +210,9 @@ function button(
     label,
     style
   };
+}
+
+function formatDelta(delta: number | undefined): string {
+  if (delta === undefined) return "-";
+  return `${delta >= 0 ? "+" : ""}${delta}`;
 }

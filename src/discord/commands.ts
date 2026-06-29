@@ -8,9 +8,27 @@ import type {
   Interaction
 } from "discord.js";
 import { graphReply } from "./graphs";
-import { assignmentEmbed, graphsHelpMessage, helpMessage, leaderboardMessage, profileMessage, queueMessage, trainingButtons, trainingHelpMessage } from "./messages";
+import type { DuelComparison } from "./duels";
+import {
+  assignmentEmbed,
+  duelAcceptedMessage,
+  duelButtons,
+  duelChallengeMessage,
+  duelDeniedMessage,
+  duelEmbed,
+  duelHistoryMessage,
+  duelPendingMessage,
+  duelStatusMessage,
+  graphsHelpMessage,
+  helpMessage,
+  leaderboardMessage,
+  profileMessage,
+  queueMessage,
+  trainingButtons,
+  trainingHelpMessage
+} from "./messages";
 import { getUtcMonthKey } from "./time";
-import type { DiscordTrainingBotService, PendingVerificationResult, TrainingResolutionResult } from "./service";
+import type { DiscordTrainingBotService, DuelStatusResult, DuelVerifyResult, PendingVerificationResult, TrainingResolutionResult } from "./service";
 import type { DiscordBotStore } from "./storage";
 import type { DifficultyColor, PendingLinkChallenge, ProblemFilters } from "./types";
 
@@ -68,6 +86,21 @@ export function buildDiscordCommands(): RESTPostAPIChatInputApplicationCommandsJ
           .setName("period")
           .setDescription("Leaderboard period")
           .addChoices({ name: "month", value: "month" }, { name: "alltime", value: "alltime" }))),
+    new SlashCommandBuilder()
+      .setName("duel")
+      .setDescription("Challenge linked server members to AtCoder duels.")
+      .addSubcommand((command) => command
+        .setName("challenge")
+        .setDescription("Challenge a linked server member.")
+        .addUserOption((option) => option.setName("user").setDescription("Discord member").setRequired(true)))
+      .addSubcommand((command) => command.setName("accept").setDescription("Accept your oldest pending duel challenge."))
+      .addSubcommand((command) => command.setName("deny").setDescription("Deny your oldest pending duel challenge."))
+      .addSubcommand((command) => command.setName("status").setDescription("Show your active duel or pending challenges."))
+      .addSubcommand((command) => command.setName("verify").setDescription("Check whether your active duel can be resolved."))
+      .addSubcommand((command) => command
+        .setName("history")
+        .setDescription("Show recent completed duels.")
+        .addUserOption((option) => option.setName("user").setDescription("Discord user"))),
     buildGraphCommand("graphs", "Render progress graphs.")
   ].map((command) => command.toJSON());
 }
@@ -105,6 +138,7 @@ export async function handleInteraction(interaction: Interaction, service: Disco
 export function shouldReplyEphemerally(commandName: string, subcommand?: string): boolean {
   if (commandName === "link" || commandName === "gimme") return true;
   if (commandName === "graphs" && subcommand === "help") return true;
+  if (commandName === "duel") return subcommand === "accept" || subcommand === "deny" || subcommand === "verify";
   if (commandName !== "train") return false;
   return subcommand === "help" ||
     subcommand === "start" ||
@@ -153,10 +187,75 @@ async function routeCommand(interaction: ChatInputCommandInteraction, service: D
     case "train":
       await handleTrainCommand(interaction, service, store);
       return;
+    case "duel":
+      await handleDuelCommand(interaction, service);
+      return;
     case "graphs": {
       await handleGraphCommand(interaction, service, store);
       return;
     }
+  }
+}
+
+async function handleDuelCommand(interaction: ChatInputCommandInteraction, service: DiscordTrainingBotService): Promise<void> {
+  const guildId = interaction.guildId!;
+  const discordUserId = interaction.user.id;
+  const subcommand = interaction.options.getSubcommand();
+  if (subcommand === "challenge") {
+    const target = interaction.options.getUser("user", true);
+    if (target.bot) throw new Error("You cannot challenge a bot.");
+    const result = await service.challengeDuel(guildId, discordUserId, target.id);
+    await sendInteractionResponse(interaction, {
+      content: duelChallengeMessage(result.duel),
+      components: [duelButtons(result.duel.id)],
+      ephemeral: shouldReplyEphemerally("duel", subcommand)
+    });
+    return;
+  }
+  if (subcommand === "accept") {
+    const result = await service.acceptDuel(guildId, discordUserId);
+    await sendInteractionResponse(interaction, {
+      content: duelAcceptedMessage(result.duel),
+      embeds: [duelEmbed(result.duel)],
+      ephemeral: shouldReplyEphemerally("duel", subcommand)
+    });
+    return;
+  }
+  if (subcommand === "deny") {
+    const result = await service.denyDuel(guildId, discordUserId);
+    await sendInteractionResponse(interaction, {
+      content: duelDeniedMessage(result.duel),
+      ephemeral: shouldReplyEphemerally("duel", subcommand)
+    });
+    return;
+  }
+  if (subcommand === "status") {
+    const result = await service.getDuelStatus(guildId, discordUserId);
+    await sendInteractionResponse(interaction, {
+      content: duelStatusResultMessage(result),
+      ephemeral: shouldReplyEphemerally("duel", subcommand)
+    });
+    return;
+  }
+  if (subcommand === "verify") {
+    const result = await service.verifyDuel(guildId, discordUserId);
+    const reply: InteractionReplyOptions = {
+      content: duelVerifyMessage(result),
+      ephemeral: shouldReplyEphemerally("duel", subcommand)
+    };
+    if (result.status === "completed") reply.embeds = [duelEmbed(result.duel)];
+    await sendInteractionResponse(interaction, {
+      ...reply
+    });
+    return;
+  }
+  if (subcommand === "history") {
+    const target = interaction.options.getUser("user") ?? interaction.user;
+    const history = service.listDuelHistory(guildId, target.id);
+    await sendInteractionResponse(interaction, {
+      content: duelHistoryMessage(history, target.id),
+      ephemeral: shouldReplyEphemerally("duel", subcommand)
+    });
   }
 }
 
@@ -280,6 +379,26 @@ async function handleButton(interaction: ButtonInteraction, service: DiscordTrai
     return;
   }
   const [scope, action, assignmentId] = interaction.customId.split(":");
+  if (scope === "duel" && (action === "accept" || action === "deny")) {
+    const duelId = Number(assignmentId);
+    if (!Number.isSafeInteger(duelId)) {
+      await interaction.reply({ content: "That duel button is invalid. Use /duel status for current challenges.", ephemeral: true });
+      return;
+    }
+    try {
+      await interaction.deferReply({ ephemeral: true });
+      if (action === "accept") {
+        const result = await service.acceptDuel(interaction.guildId, interaction.user.id, undefined, duelId);
+        await sendInteractionResponse(interaction, { content: duelAcceptedMessage(result.duel), embeds: [duelEmbed(result.duel)], ephemeral: true });
+        return;
+      }
+      const result = await service.denyDuel(interaction.guildId, interaction.user.id, undefined, duelId);
+      await sendInteractionResponse(interaction, { content: duelDeniedMessage(result.duel), ephemeral: true });
+    } catch (error) {
+      await sendInteractionResponse(interaction, { content: error instanceof Error ? error.message : "Button action failed.", ephemeral: true });
+    }
+    return;
+  }
   if (scope !== "train" || (action !== "completed" && action !== "assisted" && action !== "skip")) return;
   const expectedAssignmentId = Number(assignmentId);
   if (!Number.isSafeInteger(expectedAssignmentId)) {
@@ -305,6 +424,9 @@ async function deferIfSlowCommand(interaction: ChatInputCommandInteraction): Pro
 function shouldDeferCommand(commandName: string, subcommand: string | null): boolean {
   if (commandName === "link" || commandName === "gimme") return true;
   if (commandName === "graphs") return subcommand !== "help";
+  if (commandName === "duel") {
+    return subcommand === "challenge" || subcommand === "accept" || subcommand === "deny" || subcommand === "verify";
+  }
   if (commandName !== "train") return false;
   return subcommand === "start" ||
     subcommand === "completed" ||
@@ -362,6 +484,38 @@ function pendingVerificationMessage(result: PendingVerificationResult): string {
   if (result.checked === 0) return "You have no pending completion claims.";
   if (result.verified === 0) return `Checked ${result.checked} pending claim(s). No new ACs were visible yet.`;
   return `Verified ${result.verified} pending claim(s). ${result.remaining} still pending.`;
+}
+
+function duelStatusResultMessage(result: DuelStatusResult): string {
+  if (result.status === "pending") return duelPendingMessage(result.sent, result.received);
+  return duelStatusMessage(result.duel, duelComparisonMessage(result.comparison));
+}
+
+function duelVerifyMessage(result: DuelVerifyResult): string {
+  if (result.status === "completed") {
+    const already = result.alreadyCompleted ? "Already completed." : "Duel completed.";
+    const challengerDelta = formatSigned(result.duel.challengerDelta);
+    const targetDelta = formatSigned(result.duel.targetDelta);
+    return `${already} Result: ${result.duel.result}. Ratings: <@${result.duel.challengerUserId}> ${result.duel.challengerRatingBefore} -> ${result.duel.challengerRatingAfter} (${challengerDelta}), <@${result.duel.targetUserId}> ${result.duel.targetRatingBefore} -> ${result.duel.targetRatingAfter} (${targetDelta}).`;
+  }
+  if (result.status === "expired") return "This duel expired without a rating change.";
+  if (result.status === "pending_judgement") return "A relevant submission is still pending or judging. Retry `/duel verify` later.";
+  return duelStatusMessage(result.duel, duelComparisonMessage(result.comparison));
+}
+
+function duelComparisonMessage(comparison: DuelComparison): string {
+  if (comparison.status === "pending_judgement") return "A relevant submission is still pending or judging. Retry verification later.";
+  if (comparison.status === "completed") return `Ready to resolve: ${comparison.result}.`;
+  if (comparison.status === "expired") return "This duel has expired.";
+  if (comparison.reason === "higher_window_open") {
+    return `Higher-rated player solved. Lower-rated player still has ${comparison.remainingSeconds ?? 0} second(s) in the handicap window.`;
+  }
+  return "No accepted submissions are visible yet.";
+}
+
+function formatSigned(value: number | undefined): string {
+  if (value === undefined) return "-";
+  return `${value >= 0 ? "+" : ""}${value}`;
 }
 
 function readProblemFilters(interaction: ChatInputCommandInteraction): ProblemFilters {

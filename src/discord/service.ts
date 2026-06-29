@@ -1,12 +1,19 @@
 import { randomBytes } from "node:crypto";
-import type { AtCoderDataset } from "../types";
+import type { AtCoderDataset, Submission } from "../types";
 import { selectRandomProblem, selectTrainingProblem } from "./problem-selection";
 import { reviewDelaySeconds, updateTrainingRating } from "./scoring";
 import { getUtcMonthKey } from "./time";
 import type { DiscordAtCoderService } from "./atcoder";
 import type { DiscordBotStore } from "./storage";
 import type { OfficialRatingPoint } from "../types";
-import type { BotAssignment, LinkedUser, PendingLinkChallenge, ProblemFilters, ScoreReason } from "./types";
+import type { BotAssignment, Duel, DuelProfile, LinkedUser, PendingLinkChallenge, ProblemFilters, ScoreReason } from "./types";
+import {
+  calculateHandicapCoefficient,
+  compareDuelSolves,
+  DUEL_ACTIVE_TTL_SECONDS,
+  DUEL_PENDING_TTL_SECONDS,
+  type DuelComparison
+} from "./duels";
 
 type TrainingOutcome = "completed" | "assisted" | "skipped";
 
@@ -28,6 +35,18 @@ export interface PendingVerificationResult {
   verified: number;
   remaining: number;
 }
+
+export type DuelChallengeResult = { duel: Duel; challenger: LinkedUser; target: LinkedUser };
+export type DuelAcceptResult = { duel: Duel; challengerProfile: DuelProfile; targetProfile: DuelProfile };
+export type DuelDenyResult = { duel: Duel };
+export type DuelStatusResult =
+  | { status: "active"; duel: Duel; comparison: DuelComparison }
+  | { status: "pending"; sent: Duel[]; received: Duel[] };
+export type DuelVerifyResult =
+  | { status: "completed"; duel: Duel; alreadyCompleted: boolean }
+  | { status: "active"; duel: Duel; comparison: DuelComparison }
+  | { status: "expired"; duel: Duel }
+  | { status: "pending_judgement"; duel: Duel };
 
 export class DiscordTrainingBotService {
   constructor(private readonly store: DiscordBotStore, private readonly atcoder: DiscordAtCoderService) {}
@@ -203,8 +222,167 @@ export class DiscordTrainingBotService {
     return assignment;
   }
 
+  async challengeDuel(guildId: string, challengerUserId: string, targetUserId: string, now = nowSecond()): Promise<DuelChallengeResult> {
+    if (challengerUserId === targetUserId) throw new Error("You cannot duel yourself.");
+    this.store.expireStaleDuels(now);
+    const challenger = this.store.getLinkedUserOrThrow(guildId, challengerUserId);
+    const target = this.store.getLinkedUser(guildId, targetUserId);
+    if (!target) throw new Error("That Discord user is not linked. They need to use /link first.");
+    if (this.store.findDuplicatePendingDuel(guildId, challengerUserId, targetUserId, now)) {
+      throw new Error("There is already a pending duel challenge between those users.");
+    }
+    if (this.store.getActiveDuelConflict(guildId, challengerUserId, targetUserId)) {
+      throw new Error("One of those users is already in an active duel.");
+    }
+    const duel = this.store.createPendingDuel({
+      guildId,
+      challengerUserId,
+      targetUserId,
+      challengedAt: now,
+      expiresAt: now + DUEL_PENDING_TTL_SECONDS
+    });
+    return { duel, challenger, target };
+  }
+
+  async acceptDuel(guildId: string, discordUserId: string, now = nowSecond(), duelId?: number): Promise<DuelAcceptResult> {
+    this.store.expireStaleDuels(now);
+    const pending = duelId === undefined ? this.store.getOldestReceivedPendingDuel(guildId, discordUserId, now) : this.store.getDuel(duelId);
+    if (!pending || pending.guildId !== guildId || pending.status !== "pending" || pending.expiresAt === undefined || pending.expiresAt <= now) {
+      throw new Error("That duel challenge is no longer pending.");
+    }
+    if (pending.targetUserId !== discordUserId) throw new Error("Only the challenged user can accept this duel.");
+    if (this.store.getActiveDuelConflict(guildId, pending.challengerUserId, pending.targetUserId)) {
+      throw new Error("One of those users is already in an active duel.");
+    }
+
+    const challenger = this.store.getLinkedUserOrThrow(guildId, pending.challengerUserId);
+    const target = this.store.getLinkedUserOrThrow(guildId, pending.targetUserId);
+    const challengerProfile = await this.ensureDuelProfile(challenger, now);
+    const targetProfile = await this.ensureDuelProfile(target, now);
+    const dataset = await this.atcoder.getDataset(challenger.atcoderUsername);
+    const row = selectRandomProblem(dataset, { unsolvedOnly: true });
+    if (!row || row.difficulty === null) throw new Error("No duel problem is available right now.");
+
+    const lowerRatedUserId = challengerProfile.duelRating <= targetProfile.duelRating ? challenger.discordUserId : target.discordUserId;
+    const higherRatedUserId = lowerRatedUserId === challenger.discordUserId ? target.discordUserId : challenger.discordUserId;
+    const lowerRating = Math.min(challengerProfile.duelRating, targetProfile.duelRating);
+    const higherRating = Math.max(challengerProfile.duelRating, targetProfile.duelRating);
+    const duel = this.store.acceptDuel({
+      duelId: pending.id,
+      challengerHandle: challenger.atcoderUsername,
+      targetHandle: target.atcoderUsername,
+      problemId: row.problem.id,
+      contestId: row.problem.contest_id,
+      title: row.problem.title,
+      difficulty: row.difficulty,
+      challengerRating: challengerProfile.duelRating,
+      targetRating: targetProfile.duelRating,
+      lowerRatedUserId,
+      higherRatedUserId,
+      handicapCoefficient: calculateHandicapCoefficient(row.difficulty, lowerRating, higherRating),
+      acceptedAt: now,
+      expiresAt: now + DUEL_ACTIVE_TTL_SECONDS
+    });
+    if (!duel) throw new Error("That duel challenge is no longer pending.");
+    return { duel, challengerProfile, targetProfile };
+  }
+
+  async denyDuel(guildId: string, discordUserId: string, now = nowSecond(), duelId?: number): Promise<DuelDenyResult> {
+    this.store.expireStaleDuels(now);
+    const pending = duelId === undefined ? this.store.getOldestReceivedPendingDuel(guildId, discordUserId, now) : this.store.getDuel(duelId);
+    if (!pending || pending.guildId !== guildId || pending.status !== "pending" || pending.expiresAt === undefined || pending.expiresAt <= now) {
+      throw new Error("That duel challenge is no longer pending.");
+    }
+    if (pending.targetUserId !== discordUserId && pending.challengerUserId !== discordUserId) {
+      throw new Error("Only a participant can deny this duel.");
+    }
+    const duel = this.store.declineDuel(pending.id, now);
+    if (!duel) throw new Error("That duel challenge is no longer pending.");
+    return { duel };
+  }
+
+  async getDuelStatus(guildId: string, discordUserId: string, now = nowSecond()): Promise<DuelStatusResult> {
+    this.store.expireStaleDuels(now);
+    const active = this.store.getActiveDuelForUser(guildId, discordUserId);
+    if (!active) {
+      const pending = this.store.listPendingDuelsForUser(guildId, discordUserId, now);
+      return { status: "pending", sent: pending.sent, received: pending.received };
+    }
+    const comparison = await this.compareActiveDuel(active, now);
+    if (comparison.status === "expired") {
+      this.store.expireDuel(active.id, now);
+      const pending = this.store.listPendingDuelsForUser(guildId, discordUserId, now);
+      return { status: "pending", sent: pending.sent, received: pending.received };
+    }
+    return { status: "active", duel: active, comparison };
+  }
+
+  async verifyDuel(guildId: string, discordUserId: string, now = nowSecond()): Promise<DuelVerifyResult> {
+    this.store.expireStaleDuels(now);
+    const active = this.store.getActiveDuelForUser(guildId, discordUserId);
+    if (!active) {
+      const latest = this.store.listCompletedDuelsForUser(guildId, discordUserId, 1)[0];
+      if (latest) return { status: "completed", duel: latest, alreadyCompleted: true };
+      throw new Error("You do not have an active duel.");
+    }
+    const comparison = await this.compareActiveDuel(active, now);
+    if (comparison.status === "pending_judgement") return { status: "pending_judgement", duel: active };
+    if (comparison.status === "expired") {
+      const expired = this.store.expireDuel(active.id, now) ?? active;
+      return { status: "expired", duel: expired };
+    }
+    if (comparison.status === "completed") {
+      const completed = this.store.completeDuel({ duel: active, completion: comparison, now });
+      return { status: "completed", duel: completed ?? active, alreadyCompleted: false };
+    }
+    return { status: "active", duel: active, comparison };
+  }
+
+  listDuelHistory(guildId: string, discordUserId: string): Duel[] {
+    this.store.getLinkedUserOrThrow(guildId, discordUserId);
+    return this.store.listCompletedDuelsForUser(guildId, discordUserId, 10);
+  }
+
   getDatasetForTests(username: string): Promise<AtCoderDataset> {
     return this.atcoder.getDataset(username);
+  }
+
+  private async ensureDuelProfile(user: LinkedUser, now: number): Promise<DuelProfile> {
+    const existing = this.store.getDuelProfile(user.guildId, user.discordUserId);
+    if (existing) return this.store.upsertDuelProfile({
+      guildId: user.guildId,
+      discordUserId: user.discordUserId,
+      atcoderUsername: user.atcoderUsername,
+      initialRating: existing.duelRating,
+      now
+    });
+    const initialRating = await this.atcoder.getInitialDuelRating(user.atcoderUsername);
+    return this.store.upsertDuelProfile({
+      guildId: user.guildId,
+      discordUserId: user.discordUserId,
+      atcoderUsername: user.atcoderUsername,
+      initialRating,
+      now
+    });
+  }
+
+  private async compareActiveDuel(duel: Duel, now: number): Promise<DuelComparison> {
+    if (!duel.acceptedAt || !duel.contestId || !duel.problemId || !duel.challengerHandle || !duel.targetHandle) {
+      throw new Error("Active duel is missing verification metadata.");
+    }
+    const [challengerSubmissions, targetSubmissions] = await Promise.all([
+      this.atcoder.getProblemSubmissions(duel.challengerHandle, duel.contestId, duel.problemId, duel.acceptedAt),
+      this.atcoder.getProblemSubmissions(duel.targetHandle, duel.contestId, duel.problemId, duel.acceptedAt)
+    ]);
+    const challengerSolvedAt = firstAcceptedAt(challengerSubmissions);
+    const targetSolvedAt = firstAcceptedAt(targetSubmissions);
+    return compareDuelSolves({
+      duel,
+      challengerSolvedAt,
+      targetSolvedAt,
+      hasPendingJudgement: hasPendingJudgement(challengerSubmissions) || hasPendingJudgement(targetSubmissions),
+      now
+    });
   }
 
   private verifyScoredAssignment(
@@ -272,6 +450,14 @@ function outcomeFromPendingStatus(status: BotAssignment["status"]): ScoreReason 
   if (status === "pending_completed") return "completed";
   if (status === "pending_assisted") return "assisted";
   return null;
+}
+
+function firstAcceptedAt(submissions: Submission[]): number | undefined {
+  return submissions.find((submission) => submission.result === "AC")?.epoch_second;
+}
+
+function hasPendingJudgement(submissions: Submission[]): boolean {
+  return submissions.some((submission) => submission.result === "WJ" || submission.result === "Judging");
 }
 
 function alreadyResolvedAssignmentMessage(assignment: BotAssignment): string {

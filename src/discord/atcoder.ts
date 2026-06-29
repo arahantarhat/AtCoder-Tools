@@ -19,6 +19,11 @@ export class DiscordAtCoderService {
     return Math.max(400, history.at(-1)?.rating ?? 400);
   }
 
+  async getInitialDuelRating(username: string): Promise<number> {
+    const history = await this.dataService.getRatingHistory(username).catch((): OfficialRatingPoint[] => []);
+    return history.at(-1)?.rating ?? 1200;
+  }
+
   getRatingHistory(username: string): Promise<OfficialRatingPoint[]> {
     return this.dataService.getRatingHistory(username);
   }
@@ -43,6 +48,14 @@ export class DiscordAtCoderService {
     return fallback.some((submission) => isResultAfter(submission, problemId, result, fromSecond));
   }
 
+  async getProblemSubmissions(username: string, contestId: string, problemId: string, fromSecond: number): Promise<Submission[]> {
+    const direct = await this.fetchContestSubmissions(username, contestId, "").catch((): Submission[] | null => null);
+    const fallback = await this.dataService.getRecentSubmissions(username, fromSecond, [{ contestId, problemId }]).catch((): Submission[] => []);
+    return uniqueSubmissions([...(direct ?? []), ...fallback])
+      .filter((submission) => submission.problem_id === problemId && submission.epoch_second >= fromSecond)
+      .sort((a, b) => a.epoch_second - b.epoch_second || a.id - b.id);
+  }
+
   private async fetchContestSubmissions(username: string, contestId: string, result: string): Promise<Submission[]> {
     const url = `https://atcoder.jp/contests/${encodeURIComponent(contestId)}/submissions?f.User=${encodeURIComponent(username)}&f.Task=&f.LanguageName=&f.Status=${encodeURIComponent(result)}`;
     const response = await this.fetchImpl(url);
@@ -53,6 +66,12 @@ export class DiscordAtCoderService {
 
 function isResultAfter(submission: Submission, problemId: string, result: string, fromSecond: number): boolean {
   return submission.problem_id === problemId && submission.result === result && submission.epoch_second >= fromSecond;
+}
+
+function uniqueSubmissions(submissions: Submission[]): Submission[] {
+  const byId = new Map<number, Submission>();
+  for (const submission of submissions) byId.set(submission.id, submission);
+  return [...byId.values()];
 }
 
 export function profileAffiliationHasVerificationCode(html: string, code: string): boolean {

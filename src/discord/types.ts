@@ -110,3 +110,49 @@ export interface SelectedProblem {
   targetDelta: number;
   points: number;
 }
+
+export type DuelStatus = "pending" | "active" | "completed" | "declined" | "expired" | "cancelled";
+export type DuelResult = "challenger_win" | "target_win" | "draw" | "expired";
+
+export interface DuelProfile {
+  guildId: string;
+  discordUserId: string;
+  atcoderUsername: string;
+  duelRating: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface Duel {
+  id: number;
+  guildId: string;
+  challengerUserId: string;
+  targetUserId: string;
+  challengerHandle?: string | undefined;
+  targetHandle?: string | undefined;
+  problemId?: string | undefined;
+  contestId?: string | undefined;
+  title?: string | undefined;
+  difficulty?: number | undefined;
+  status: DuelStatus;
+  challengedAt: number;
+  acceptedAt?: number | undefined;
+  expiresAt?: number | undefined;
+  completedAt?: number | undefined;
+  declinedAt?: number | undefined;
+  cancelledAt?: number | undefined;
+  expiredAt?: number | undefined;
+  handicapCoefficient?: number | undefined;
+  lowerRatedUserId?: string | undefined;
+  higherRatedUserId?: string | undefined;
+  challengerRatingBefore?: number | undefined;
+  targetRatingBefore?: number | undefined;
+  challengerRatingAfter?: number | undefined;
+  targetRatingAfter?: number | undefined;
+  challengerDelta?: number | undefined;
+  targetDelta?: number | undefined;
+  result?: DuelResult | undefined;
+  winnerUserId?: string | undefined;
+  challengerSolvedAt?: number | undefined;
+  targetSolvedAt?: number | undefined;
+}

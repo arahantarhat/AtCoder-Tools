@@ -8,8 +8,9 @@ import { pointsForDelta, reviewDelaySeconds, updateTrainingRating } from "../src
 import { DiscordTrainingBotService } from "../src/discord/service";
 import { DiscordBotStore } from "../src/discord/storage";
 import { getUtcMonthKey } from "../src/discord/time";
+import { calculateDuelElo, calculateHandicapCoefficient, compareDuelSolves } from "../src/discord/duels";
 import { profileAffiliationHasVerificationCode, type DiscordAtCoderService } from "../src/discord/atcoder";
-import type { AtCoderDataset, OfficialRatingPoint } from "../src/types";
+import type { AtCoderDataset, OfficialRatingPoint, Submission } from "../src/types";
 
 const dataset: AtCoderDataset = {
   contests: [
@@ -69,6 +70,20 @@ describe("Discord bot domain", () => {
 
   it("sets longer review delays for skipped problems", () => {
     expect(reviewDelaySeconds("skipped")).toBeGreaterThan(reviewDelaySeconds("assisted"));
+  });
+
+  it("calculates duel Elo with K=60", () => {
+    expect(calculateDuelElo(1200, 1200, 1)).toMatchObject({ deltaA: 30, deltaB: -30, ratingAAfter: 1230, ratingBAfter: 1170 });
+    expect(calculateDuelElo(1000, 1600, 1).deltaA).toBeGreaterThan(55);
+    expect(calculateDuelElo(1600, 1000, 1).deltaA).toBeLessThan(5);
+    expect(calculateDuelElo(1200, 1200, 0.5)).toMatchObject({ deltaA: 0, deltaB: 0 });
+  });
+
+  it("calculates duel handicap coefficients", () => {
+    expect(calculateHandicapCoefficient(1200, 1200, 1200)).toBe(1);
+    expect(calculateHandicapCoefficient(1200, 800, 1600)).toBeGreaterThan(1);
+    expect(calculateHandicapCoefficient(4000, 0, 4000)).toBe(3);
+    expect(calculateHandicapCoefficient(4000, 4000, 0)).toBe(1 / 3);
   });
 });
 
@@ -192,6 +207,67 @@ describe("Discord bot storage", () => {
       { dayKey: "2026-06-26", epochSecond: Math.floor(Date.parse("2026-06-26T01:00:00Z") / 1000), rating: 1425 }
     ]);
     store.close();
+  });
+});
+
+describe("Discord duel verification rules", () => {
+  const baseDuel = {
+    id: 1,
+    guildId: "guild",
+    challengerUserId: "1",
+    targetUserId: "2",
+    status: "active" as const,
+    challengedAt: 90,
+    acceptedAt: 100,
+    expiresAt: 100 + 24 * 60 * 60,
+    handicapCoefficient: 2,
+    lowerRatedUserId: "1",
+    higherRatedUserId: "2"
+  };
+
+  it("keeps duels active when nobody solved", () => {
+    expect(compareDuelSolves({ duel: baseDuel, hasPendingJudgement: false, now: 150 })).toMatchObject({
+      status: "active",
+      reason: "nobody_solved"
+    });
+  });
+
+  it("lets lower-rated solve immediately", () => {
+    expect(compareDuelSolves({ duel: baseDuel, challengerSolvedAt: 180, hasPendingJudgement: false, now: 181 })).toMatchObject({
+      status: "completed",
+      result: "challenger_win",
+      winnerUserId: "1"
+    });
+  });
+
+  it("keeps higher-rated solve open until the lower handicap window closes", () => {
+    expect(compareDuelSolves({ duel: baseDuel, targetSolvedAt: 200, hasPendingJudgement: false, now: 250 })).toMatchObject({
+      status: "active",
+      reason: "higher_window_open",
+      remainingSeconds: 50
+    });
+    expect(compareDuelSolves({ duel: baseDuel, targetSolvedAt: 200, hasPendingJudgement: false, now: 300 })).toMatchObject({
+      status: "completed",
+      result: "target_win",
+      winnerUserId: "2"
+    });
+  });
+
+  it("compares both solves by adjusted duration and detects exact draws", () => {
+    expect(compareDuelSolves({ duel: baseDuel, challengerSolvedAt: 250, targetSolvedAt: 200, hasPendingJudgement: false, now: 260 })).toMatchObject({
+      status: "completed",
+      result: "challenger_win"
+    });
+    expect(compareDuelSolves({ duel: baseDuel, challengerSolvedAt: 300, targetSolvedAt: 200, hasPendingJudgement: false, now: 310 })).toMatchObject({
+      status: "completed",
+      result: "draw"
+    });
+  });
+
+  it("asks users to retry while submissions are pending or judging", () => {
+    expect(compareDuelSolves({ duel: baseDuel, hasPendingJudgement: true, now: 150 })).toMatchObject({
+      status: "pending_judgement"
+    });
   });
 });
 
@@ -390,9 +466,107 @@ describe("Discord bot service", () => {
     store.close();
   });
 
+  it("creates, accepts, denies, and rejects invalid duel challenges", async () => {
+    const store = new DiscordBotStore(":memory:");
+    const service = new DiscordTrainingBotService(store, fakeDuelAtCoder({}));
+    await linkForTest(service, "guild", "1", "tourist", 1_700_000_000);
+    await linkForTest(service, "guild", "2", "benq", 1_700_000_000);
+
+    await expect(service.challengeDuel("guild", "1", "1", 1_700_000_100)).rejects.toThrow(/yourself/);
+    await expect(service.challengeDuel("guild", "1", "3", 1_700_000_100)).rejects.toThrow(/not linked/);
+
+    const challenge = await service.challengeDuel("guild", "1", "2", 1_700_000_100);
+    expect(challenge.duel.status).toBe("pending");
+    await expect(service.challengeDuel("guild", "2", "1", 1_700_000_110)).rejects.toThrow(/already a pending/);
+
+    const accepted = await service.acceptDuel("guild", "2", 1_700_000_120, challenge.duel.id);
+    expect(accepted.duel.status).toBe("active");
+    expect(accepted.duel.challengerHandle).toBe("tourist");
+    expect(accepted.duel.targetHandle).toBe("benq");
+    expect(accepted.duel.problemId).toBeTruthy();
+    expect(accepted.duel.difficulty).toEqual(expect.any(Number));
+    expect(store.getDuelProfile("guild", "1")?.duelRating).toBe(1200);
+
+    await expect(service.challengeDuel("guild", "1", "2", 1_700_000_130)).rejects.toThrow(/active duel/);
+    store.close();
+  });
+
+  it("lets slash fallbacks deny the oldest received duel and expires stale pending challenges", async () => {
+    const store = new DiscordBotStore(":memory:");
+    const service = new DiscordTrainingBotService(store, fakeDuelAtCoder({}));
+    await linkForTest(service, "guild", "1", "tourist", 1_700_000_000);
+    await linkForTest(service, "guild", "2", "benq", 1_700_000_000);
+    await linkForTest(service, "guild", "3", "rng58", 1_700_000_000);
+
+    const stale = await service.challengeDuel("guild", "1", "2", 1_700_000_100);
+    await expect(service.acceptDuel("guild", "2", 1_700_001_001, stale.duel.id)).rejects.toThrow(/no longer pending/);
+
+    const first = await service.challengeDuel("guild", "1", "2", 1_700_001_100);
+    await service.challengeDuel("guild", "3", "2", 1_700_001_110);
+    const denied = await service.denyDuel("guild", "2", 1_700_001_120);
+    expect(denied.duel.id).toBe(first.duel.id);
+    expect(denied.duel.status).toBe("declined");
+    store.close();
+  });
+
+  it("verifies duel outcomes and keeps repeated verification idempotent", async () => {
+    const store = new DiscordBotStore(":memory:");
+    const submissions: Record<string, Submission[]> = {
+      tourist: [],
+      benq: []
+    };
+    const service = new DiscordTrainingBotService(store, fakeDuelAtCoder(submissions));
+    await linkForTest(service, "guild", "1", "tourist", 1_700_000_000);
+    await linkForTest(service, "guild", "2", "benq", 1_700_000_000);
+    const challenge = await service.challengeDuel("guild", "1", "2", 1_700_000_100);
+    const accepted = await service.acceptDuel("guild", "2", 1_700_000_200, challenge.duel.id);
+
+    await expect(service.verifyDuel("guild", "1", 1_700_000_250)).resolves.toMatchObject({
+      status: "active",
+      comparison: { status: "active", reason: "nobody_solved" }
+    });
+
+    submissions.tourist = [submission("tourist", accepted.duel, "AC", 1_700_000_300)];
+    const completed = await service.verifyDuel("guild", "1", 1_700_000_320);
+
+    expect(completed).toMatchObject({ status: "completed", alreadyCompleted: false });
+    expect(completed.status === "completed" ? completed.duel.status : null).toBe("completed");
+    expect(store.getDuelProfile("guild", "1")?.duelRating).toBeGreaterThan(1200);
+    const afterFirst = store.getDuelProfile("guild", "1")?.duelRating;
+
+    const repeated = await service.verifyDuel("guild", "1", 1_700_000_400);
+
+    expect(repeated).toMatchObject({ status: "completed", alreadyCompleted: true });
+    expect(store.getDuelProfile("guild", "1")?.duelRating).toBe(afterFirst);
+    store.close();
+  });
+
+  it("reports pending judgement and higher-rated handicap windows for duel verification", async () => {
+    const store = new DiscordBotStore(":memory:");
+    const submissions: Record<string, Submission[]> = {
+      tourist: [],
+      benq: []
+    };
+    const service = new DiscordTrainingBotService(store, fakeDuelAtCoder(submissions, { tourist: 1000, benq: 1600 }));
+    await linkForTest(service, "guild", "1", "tourist", 1_700_000_000);
+    await linkForTest(service, "guild", "2", "benq", 1_700_000_000);
+    const challenge = await service.challengeDuel("guild", "1", "2", 1_700_000_100);
+    const accepted = await service.acceptDuel("guild", "2", 1_700_000_200, challenge.duel.id);
+
+    submissions.benq = [submission("benq", accepted.duel, "Judging", 1_700_000_240)];
+    await expect(service.verifyDuel("guild", "1", 1_700_000_250)).resolves.toMatchObject({ status: "pending_judgement" });
+
+    submissions.benq = [submission("benq", accepted.duel, "AC", 1_700_000_240)];
+    await expect(service.verifyDuel("guild", "1", 1_700_000_250)).resolves.toMatchObject({
+      status: "active",
+      comparison: { status: "active", reason: "higher_window_open" }
+    });
+    store.close();
+  });
+
   it("exposes the V1 slash commands including help", () => {
     const commands = buildDiscordCommands();
-    expect(commands.map((command) => command.name)).toEqual(["help", "link", "gimme", "train", "graphs"]);
+    expect(commands.map((command) => command.name)).toEqual(["help", "link", "gimme", "train", "duel", "graphs"]);
     const gimme = commands.find((command) => command.name === "gimme");
     expect(gimme?.options?.map((option) => option.name)).toEqual(["min", "max", "color", "unsolved_only"]);
     const train = commands.find((command) => command.name === "train");
@@ -416,6 +590,8 @@ describe("Discord bot service", () => {
     const leaderboardOptions = leaderboard && "options" in leaderboard ? leaderboard.options : undefined;
     expect(leaderboardOptions?.map((option) => option.name)).toEqual(["month", "period"]);
     const graphs = commands.find((command) => command.name === "graphs");
+    const duel = commands.find((command) => command.name === "duel");
+    expect(duel?.options?.map((option) => option.name)).toEqual(["challenge", "accept", "deny", "status", "verify", "history"]);
     expect(graphs?.options?.map((option) => option.name)).toEqual(["help", "official", "training", "points", "solved"]);
     for (const subcommand of graphs?.options ?? []) {
       if (subcommand.name === "help" || subcommand.name === "solved") continue;
@@ -437,9 +613,15 @@ describe("Discord bot service", () => {
     expect(shouldReplyEphemerally("train", "verify")).toBe(true);
     expect(shouldReplyEphemerally("train", "queue")).toBe(true);
     expect(shouldReplyEphemerally("train", "review")).toBe(true);
+    expect(shouldReplyEphemerally("duel", "accept")).toBe(true);
+    expect(shouldReplyEphemerally("duel", "deny")).toBe(true);
+    expect(shouldReplyEphemerally("duel", "verify")).toBe(true);
 
     expect(shouldReplyEphemerally("train", "status")).toBe(false);
     expect(shouldReplyEphemerally("train", "leaderboard")).toBe(false);
+    expect(shouldReplyEphemerally("duel", "challenge")).toBe(false);
+    expect(shouldReplyEphemerally("duel", "status")).toBe(false);
+    expect(shouldReplyEphemerally("duel", "history")).toBe(false);
     expect(shouldReplyEphemerally("graphs", "help")).toBe(true);
     expect(shouldReplyEphemerally("graphs", "training")).toBe(false);
   });
@@ -473,6 +655,33 @@ describe("Discord bot service", () => {
     expect(events).toEqual(["defer:true", "service", "edit"]);
   });
 
+  it("defers duel slash commands and routes challenge work", async () => {
+    const events: string[] = [];
+    const service = {
+      challengeDuel: async () => {
+        events.push("service");
+        return {
+          duel: {
+            id: 1,
+            guildId: "guild",
+            challengerUserId: "1",
+            targetUserId: "2",
+            status: "pending",
+            challengedAt: 1,
+            expiresAt: 901
+          },
+          challenger: { atcoderUsername: "tourist" },
+          target: { atcoderUsername: "benq" }
+        };
+      }
+    } as unknown as DiscordTrainingBotService;
+    const interaction = fakeChatInputInteraction("duel", "challenge", events, fakeUser("2"));
+
+    await handleInteraction(interaction, service, {} as DiscordBotStore);
+
+    expect(events).toEqual(["defer:false", "service", "edit"]);
+  });
+
   it("defers training buttons before resolving assignments", async () => {
     const events: string[] = [];
     const service = {
@@ -502,6 +711,36 @@ describe("Discord bot service", () => {
       }
     } as unknown as DiscordTrainingBotService;
     const interaction = fakeButtonInteraction("train:completed:1", events);
+
+    await handleInteraction(interaction, service, {} as DiscordBotStore);
+
+    expect(events).toEqual(["defer:true", "service", "edit"]);
+  });
+
+  it("defers duel buttons before accepting challenges", async () => {
+    const events: string[] = [];
+    const service = {
+      acceptDuel: async () => {
+        events.push("service");
+        return {
+          duel: {
+            id: 1,
+            guildId: "guild",
+            challengerUserId: "1",
+            targetUserId: "2",
+            status: "active",
+            challengedAt: 1,
+            acceptedAt: 2,
+            expiresAt: 3,
+            contestId: "abc250",
+            problemId: "abc250_c",
+            title: "Green",
+            difficulty: 900
+          }
+        };
+      }
+    } as unknown as DiscordTrainingBotService;
+    const interaction = fakeButtonInteraction("duel:accept:1", events);
 
     await handleInteraction(interaction, service, {} as DiscordBotStore);
 
@@ -627,19 +866,45 @@ function fakeAtCoder(solved: boolean | (() => boolean), history: OfficialRatingP
   const isSolved = () => typeof solved === "function" ? solved() : solved;
   return {
     getInitialRating: async () => 1200,
+    getInitialDuelRating: async () => 1200,
     getRatingHistory: async () => history,
     getDataset: async () => dataset,
     hasProfileVerificationCode: async () => linkChallengeVerified,
     hasAcceptedSubmission: async () => isSolved(),
-    hasSubmissionResult: async (_username: string, _contestId: string, _problemId: string, result: string) => result === "CE" ? linkChallengeVerified : isSolved()
+    hasSubmissionResult: async (_username: string, _contestId: string, _problemId: string, result: string) => result === "CE" ? linkChallengeVerified : isSolved(),
+    getProblemSubmissions: async () => []
   } as unknown as DiscordAtCoderService;
+}
+
+function fakeDuelAtCoder(submissions: Record<string, Submission[]>, ratings: Record<string, number> = {}): DiscordAtCoderService {
+  return {
+    getInitialRating: async (username: string) => ratings[username] ?? 1200,
+    getInitialDuelRating: async (username: string) => ratings[username] ?? 1200,
+    getRatingHistory: async (username: string) => [{ epochSecond: 1, rating: ratings[username] ?? 1200, contestName: "ABC" }],
+    getDataset: async () => dataset,
+    hasProfileVerificationCode: async () => true,
+    hasAcceptedSubmission: async () => false,
+    hasSubmissionResult: async () => false,
+    getProblemSubmissions: async (username: string) => submissions[username] ?? []
+  } as unknown as DiscordAtCoderService;
+}
+
+function submission(userId: string, duel: { contestId?: string | undefined; problemId?: string | undefined }, result: string, epochSecond: number): Submission {
+  return {
+    id: epochSecond,
+    epoch_second: epochSecond,
+    problem_id: duel.problemId ?? "abc250_c",
+    contest_id: duel.contestId ?? "abc250",
+    user_id: userId,
+    result
+  };
 }
 
 function fakeUser(id: string) {
   return { id } as Parameters<typeof graphReply>[1];
 }
 
-function fakeChatInputInteraction(commandName: string, subcommand: string | null, events: string[]) {
+function fakeChatInputInteraction(commandName: string, subcommand: string | null, events: string[], optionUser: { id: string; bot?: boolean } | null = null) {
   const fake = {
     commandName,
     guildId: "guild",
@@ -653,7 +918,7 @@ function fakeChatInputInteraction(commandName: string, subcommand: string | null
       getString: () => null,
       getInteger: () => null,
       getBoolean: () => null,
-      getUser: () => null
+      getUser: () => optionUser
     },
     deferReply: async (options: { ephemeral?: boolean }) => {
       events.push(`defer:${options.ephemeral === true}`);

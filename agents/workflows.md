@@ -9,6 +9,8 @@ npm start
 npm run build
 npm run bot:start
 npm run bot:build
+npm run bot:clear-commands:global
+npm run bot:clear-commands:guild
 npm run dist:mac
 ```
 
@@ -21,6 +23,10 @@ Command meanings:
 - `npm run build`: build extension/web/Electron outputs.
 - `npm run bot:build`: build the Discord bot into `dist-discord/`.
 - `npm run bot:start`: build and run the Discord bot.
+- `npm run bot:clear-commands:global`: clear stale global Discord slash
+  commands for the configured bot application.
+- `npm run bot:clear-commands:guild`: clear stale guild-scoped Discord slash
+  commands for `DISCORD_GUILD_ID`.
 - `npm run dist:mac`: run checks and create the unsigned Apple Silicon app
   bundle.
 
@@ -30,6 +36,13 @@ Discord bot environment:
 - `DISCORD_CLIENT_ID`: optional application id; defaults to the logged-in bot id.
 - `DISCORD_GUILD_ID`: optional guild id for guild-scoped command registration.
 - `DISCORD_DATA_PATH`: optional SQLite path; defaults to `data/bot.sqlite`.
+
+If Discord shows duplicate commands after moving between local and hosted
+deployments, clear the stale registration scope once. A bot running with
+`DISCORD_GUILD_ID` registers guild commands, so old global commands should be
+cleared with `npm run bot:clear-commands:global`. A bot running without
+`DISCORD_GUILD_ID` registers global commands, so old guild commands should be
+cleared with `npm run bot:clear-commands:guild`.
 
 Generated outputs are not source. Do not edit these directories directly:
 
