@@ -12,7 +12,6 @@ import type { DuelComparison } from "./duels";
 import {
   assignmentEmbed,
   duelAcceptedMessage,
-  duelButtons,
   duelChallengeMessage,
   duelDeniedMessage,
   duelEmbed,
@@ -30,7 +29,7 @@ import {
 import { getUtcMonthKey } from "./time";
 import type { DiscordTrainingBotService, DuelStatusResult, DuelVerifyResult, PendingVerificationResult, TrainingResolutionResult } from "./service";
 import type { DiscordBotStore } from "./storage";
-import type { DifficultyColor, PendingLinkChallenge, ProblemFilters } from "./types";
+import type { DifficultyColor, PendingLinkChallenge, ProblemCategory, ProblemFilters } from "./types";
 
 export function buildDiscordCommands(): RESTPostAPIChatInputApplicationCommandsJSONBody[] {
   return [
@@ -44,10 +43,10 @@ export function buildDiscordCommands(): RESTPostAPIChatInputApplicationCommandsJ
     new SlashCommandBuilder()
       .setName("gimme")
       .setDescription("Get a random AtCoder problem with optional filters.")
-      .addIntegerOption((option) => option.setName("min").setDescription("Minimum difficulty"))
-      .addIntegerOption((option) => option.setName("max").setDescription("Maximum difficulty"))
+      .addStringOption(addProblemCategoryOption)
+      .addStringOption((option) => option.setName("range").setDescription("Difficulty range, e.g. 1400-, -1400, or 1400-1600"))
       .addStringOption((option) => option.setName("color").setDescription("AtCoder color band").addChoices(...colorChoices()))
-      .addBooleanOption((option) => option.setName("unsolved_only").setDescription("Only problems not solved by your linked AtCoder handle")),
+      .addBooleanOption((option) => option.setName("allow_solved").setDescription("Allow problems you have already solved")),
     new SlashCommandBuilder()
       .setName("train")
       .setDescription("Adaptive gitgud-style training.")
@@ -92,9 +91,19 @@ export function buildDiscordCommands(): RESTPostAPIChatInputApplicationCommandsJ
       .addSubcommand((command) => command
         .setName("challenge")
         .setDescription("Challenge a linked server member.")
-        .addUserOption((option) => option.setName("user").setDescription("Discord member").setRequired(true)))
-      .addSubcommand((command) => command.setName("accept").setDescription("Accept your oldest pending duel challenge."))
-      .addSubcommand((command) => command.setName("deny").setDescription("Deny your oldest pending duel challenge."))
+        .addUserOption((option) => option.setName("user").setDescription("Discord member").setRequired(true))
+        .addStringOption(addProblemCategoryOption)
+        .addStringOption((option) => option.setName("range").setDescription("Difficulty range, e.g. 1400-, -1400, or 1400-1600"))
+        .addStringOption((option) => option.setName("color").setDescription("AtCoder color band").addChoices(...colorChoices()))
+        .addBooleanOption((option) => option.setName("allow_solved").setDescription("Allow problems either duelist has already solved")))
+      .addSubcommand((command) => command
+        .setName("accept")
+        .setDescription("Accept a pending duel challenge from a selected member. Use /duel status to list invites.")
+        .addUserOption((option) => option.setName("user").setDescription("Discord member who challenged you").setRequired(true)))
+      .addSubcommand((command) => command
+        .setName("deny")
+        .setDescription("Deny a pending duel challenge with a selected member. Use /duel status to list invites.")
+        .addUserOption((option) => option.setName("user").setDescription("Discord member in the pending duel").setRequired(true)))
       .addSubcommand((command) => command.setName("status").setDescription("Show your active duel or pending challenges."))
       .addSubcommand((command) => command.setName("verify").setDescription("Check whether your active duel can be resolved."))
       .addSubcommand((command) => command
@@ -131,7 +140,10 @@ export async function handleInteraction(interaction: Interaction, service: Disco
     await deferIfSlowCommand(interaction);
     await routeCommand(interaction, service, store);
   } catch (error) {
-    await sendInteractionResponse(interaction, { content: error instanceof Error ? error.message : "Command failed.", ephemeral: true });
+    await sendInteractionResponse(interaction, {
+      content: error instanceof Error ? error.message : "Command failed.",
+      ephemeral: shouldReplyEphemerally(interaction.commandName, getSubcommandIfPresent(interaction) ?? undefined)
+    });
   }
 }
 
@@ -195,16 +207,16 @@ async function handleDuelCommand(interaction: ChatInputCommandInteraction, servi
   if (subcommand === "challenge") {
     const target = interaction.options.getUser("user", true);
     if (target.bot) throw new Error("You cannot challenge a bot.");
-    const result = await service.challengeDuel(guildId, discordUserId, target.id);
+    const result = await service.challengeDuel(guildId, discordUserId, target.id, readProblemFilters(interaction));
     await sendInteractionResponse(interaction, {
       content: duelChallengeMessage(result.duel),
-      components: [duelButtons(result.duel.id)],
       ephemeral: shouldReplyEphemerally("duel", subcommand)
     });
     return;
   }
   if (subcommand === "accept") {
-    const result = await service.acceptDuel(guildId, discordUserId);
+    const challenger = interaction.options.getUser("user", true);
+    const result = await service.acceptDuel(guildId, discordUserId, challenger.id);
     await sendInteractionResponse(interaction, {
       content: duelAcceptedMessage(result.duel),
       embeds: [duelEmbed(result.duel)],
@@ -213,7 +225,8 @@ async function handleDuelCommand(interaction: ChatInputCommandInteraction, servi
     return;
   }
   if (subcommand === "deny") {
-    const result = await service.denyDuel(guildId, discordUserId);
+    const otherUser = interaction.options.getUser("user", true);
+    const result = await service.denyDuel(guildId, discordUserId, otherUser.id);
     await sendInteractionResponse(interaction, {
       content: duelDeniedMessage(result.duel),
       ephemeral: shouldReplyEphemerally("duel", subcommand)
@@ -371,23 +384,7 @@ async function handleButton(interaction: ButtonInteraction, service: DiscordTrai
   }
   const [scope, action, assignmentId] = interaction.customId.split(":");
   if (scope === "duel" && (action === "accept" || action === "deny")) {
-    const duelId = Number(assignmentId);
-    if (!Number.isSafeInteger(duelId)) {
-      await interaction.reply({ content: "That duel button is invalid. Use /duel status for current challenges.", ephemeral: true });
-      return;
-    }
-    try {
-      await interaction.deferReply({ ephemeral: true });
-      if (action === "accept") {
-        const result = await service.acceptDuel(interaction.guildId, interaction.user.id, undefined, duelId);
-        await sendInteractionResponse(interaction, { content: duelAcceptedMessage(result.duel), embeds: [duelEmbed(result.duel)], ephemeral: true });
-        return;
-      }
-      const result = await service.denyDuel(interaction.guildId, interaction.user.id, undefined, duelId);
-      await sendInteractionResponse(interaction, { content: duelDeniedMessage(result.duel), ephemeral: true });
-    } catch (error) {
-      await sendInteractionResponse(interaction, { content: error instanceof Error ? error.message : "Button action failed.", ephemeral: true });
-    }
+    await interaction.reply({ content: legacyDuelButtonMessage(), ephemeral: false });
     return;
   }
   if (scope !== "train" || (action !== "completed" && action !== "assisted" && action !== "skip")) return;
@@ -404,6 +401,10 @@ async function handleButton(interaction: ButtonInteraction, service: DiscordTrai
   } catch (error) {
     await sendInteractionResponse(interaction, { content: error instanceof Error ? error.message : "Button action failed.", ephemeral: true });
   }
+}
+
+function legacyDuelButtonMessage(): string {
+  return "Duel buttons are no longer active. Use `/duel status` to list pending invites, then `/duel accept user:<member>` or `/duel deny user:<member>`.";
 }
 
 async function deferIfSlowCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -510,12 +511,45 @@ function formatSigned(value: number | undefined): string {
 }
 
 function readProblemFilters(interaction: ChatInputCommandInteraction): ProblemFilters {
+  const range = parseDifficultyRange(interaction.options.getString("range"));
   return {
-    minDifficulty: interaction.options.getInteger("min") ?? undefined,
-    maxDifficulty: interaction.options.getInteger("max") ?? undefined,
+    ...range,
+    category: interaction.options.getString("category") as ProblemCategory | null ?? undefined,
     color: interaction.options.getString("color") as DifficultyColor | null ?? undefined,
-    unsolvedOnly: interaction.options.getBoolean("unsolved_only") ?? true
+    unsolvedOnly: interaction.options.getBoolean("allow_solved") !== true
   };
+}
+
+export function parseDifficultyRange(value: string | null): Pick<ProblemFilters, "minDifficulty" | "maxDifficulty"> {
+  if (value === null || value.trim() === "") return {};
+  const match = value.trim().match(/^(\d*)\s*-\s*(\d*)$/);
+  if (!match || (match[1] === "" && match[2] === "")) {
+    throw new Error("Difficulty range must look like `1400-`, `-1400`, or `1400-1600`.");
+  }
+  const minDifficulty = match[1] === "" ? undefined : Number(match[1]);
+  const maxDifficulty = match[2] === "" ? undefined : Number(match[2]);
+  if (!validDifficultyBound(minDifficulty) || !validDifficultyBound(maxDifficulty)) {
+    throw new Error("Difficulty range bounds must be non-negative integers.");
+  }
+  if (minDifficulty !== undefined && maxDifficulty !== undefined && minDifficulty > maxDifficulty) {
+    throw new Error("Difficulty range minimum cannot be greater than maximum.");
+  }
+  return { minDifficulty, maxDifficulty };
+}
+
+function validDifficultyBound(value: number | undefined): boolean {
+  return value === undefined || (Number.isSafeInteger(value) && value >= 0);
+}
+
+function addProblemCategoryOption(option: SlashCommandStringOption): SlashCommandStringOption {
+  return option
+    .setName("category")
+    .setDescription("Contest category")
+    .addChoices(
+      { name: "ABC", value: "ABC" },
+      { name: "ARC", value: "ARC" },
+      { name: "AGC", value: "AGC" }
+    );
 }
 
 function colorChoices(): Array<{ name: DifficultyColor; value: DifficultyColor }> {

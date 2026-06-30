@@ -14,10 +14,13 @@ import type {
   LinkedUser,
   MonthlyPoints,
   PendingLinkChallenge,
+  ProblemFilters,
   ScoreReason,
   ReviewQueueItem,
   ReviewReason,
-  TrainingRatingPoint
+  TrainingRatingPoint,
+  DifficultyColor,
+  ProblemCategory
 } from "./types";
 import { calculateDuelElo, type DuelCompletion } from "./duels";
 
@@ -476,13 +479,28 @@ export class DiscordBotStore implements CacheStore {
     guildId: string;
     challengerUserId: string;
     targetUserId: string;
+    filters?: ProblemFilters | undefined;
     challengedAt: number;
     expiresAt: number;
   }): Duel {
     const result = this.db.prepare(`
-      INSERT INTO duels (guild_id, challenger_user_id, target_user_id, status, challenged_at, expires_at)
-      VALUES (?, ?, ?, 'pending', ?, ?)
-    `).run(input.guildId, input.challengerUserId, input.targetUserId, input.challengedAt, input.expiresAt);
+      INSERT INTO duels (
+        guild_id, challenger_user_id, target_user_id, status, challenged_at, expires_at,
+        filter_category, filter_min_difficulty, filter_max_difficulty, filter_color, filter_allow_solved
+      )
+      VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.guildId,
+      input.challengerUserId,
+      input.targetUserId,
+      input.challengedAt,
+      input.expiresAt,
+      input.filters?.category ?? null,
+      input.filters?.minDifficulty ?? null,
+      input.filters?.maxDifficulty ?? null,
+      input.filters?.color ?? null,
+      input.filters?.unsolvedOnly === false ? 1 : 0
+    );
     return this.getDuel(Number(result.lastInsertRowid))!;
   }
 
@@ -491,7 +509,7 @@ export class DiscordBotStore implements CacheStore {
     return row ? duelFromRow(row) : null;
   }
 
-  findDuplicatePendingDuel(guildId: string, firstUserId: string, secondUserId: string, now: number): Duel | null {
+  getPendingDuelBetweenUsers(guildId: string, firstUserId: string, secondUserId: string, now: number): Duel | null {
     const row = this.db.prepare(`
       SELECT * FROM duels
       WHERE guild_id = ?
@@ -795,7 +813,12 @@ export class DiscordBotStore implements CacheStore {
         result TEXT,
         winner_user_id TEXT,
         challenger_solved_at INTEGER,
-        target_solved_at INTEGER
+        target_solved_at INTEGER,
+        filter_category TEXT,
+        filter_min_difficulty INTEGER,
+        filter_max_difficulty INTEGER,
+        filter_color TEXT,
+        filter_allow_solved INTEGER NOT NULL DEFAULT 0
       );
 
       CREATE INDEX IF NOT EXISTS ix_duels_user_status
@@ -843,6 +866,11 @@ export class DiscordBotStore implements CacheStore {
     `);
     this.addColumnIfMissing("pending_link_challenges", "verification_type", "TEXT NOT NULL DEFAULT 'profile_code'");
     this.addColumnIfMissing("pending_link_challenges", "verification_code", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("duels", "filter_category", "TEXT");
+    this.addColumnIfMissing("duels", "filter_min_difficulty", "INTEGER");
+    this.addColumnIfMissing("duels", "filter_max_difficulty", "INTEGER");
+    this.addColumnIfMissing("duels", "filter_color", "TEXT");
+    this.addColumnIfMissing("duels", "filter_allow_solved", "INTEGER NOT NULL DEFAULT 0");
   }
 
   private addColumnIfMissing(table: string, column: string, definition: string): void {
@@ -957,7 +985,12 @@ function duelFromRow(row: Row): Duel {
     result: optionalString(row.result) as Duel["result"],
     winnerUserId: optionalString(row.winner_user_id),
     challengerSolvedAt: optionalNumber(row.challenger_solved_at),
-    targetSolvedAt: optionalNumber(row.target_solved_at)
+    targetSolvedAt: optionalNumber(row.target_solved_at),
+    filterCategory: optionalString(row.filter_category) as ProblemCategory | undefined,
+    filterMinDifficulty: optionalNumber(row.filter_min_difficulty),
+    filterMaxDifficulty: optionalNumber(row.filter_max_difficulty),
+    filterColor: optionalString(row.filter_color) as DifficultyColor | undefined,
+    filterAllowSolved: Number(row.filter_allow_solved ?? 0) === 1
   };
 }
 

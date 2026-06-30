@@ -80,16 +80,6 @@ export function trainingButtons(assignmentId: number): ActionRowData<MessageActi
   };
 }
 
-export function duelButtons(duelId: number): ActionRowData<MessageActionRowComponentData> {
-  return {
-    type: ComponentType.ActionRow,
-    components: [
-      button(`duel:accept:${duelId}`, "Accept", ButtonStyle.Success),
-      button(`duel:deny:${duelId}`, "Deny", ButtonStyle.Danger)
-    ]
-  };
-}
-
 export function duelEmbed(duel: Duel): APIEmbed {
   const embed: APIEmbed = {
     title: duel.title ?? "AtCoder duel",

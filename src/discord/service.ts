@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import type { AtCoderDataset, Submission } from "../types";
-import { selectRandomProblem, selectTrainingProblem } from "./problem-selection";
+import { selectRandomDuelProblem, selectRandomProblem, selectTrainingProblem } from "./problem-selection";
 import { reviewDelaySeconds, updateTrainingRating } from "./scoring";
 import { getUtcMonthKey } from "./time";
 import type { DiscordAtCoderService } from "./atcoder";
@@ -222,13 +222,21 @@ export class DiscordTrainingBotService {
     return assignment;
   }
 
-  async challengeDuel(guildId: string, challengerUserId: string, targetUserId: string, now = nowSecond()): Promise<DuelChallengeResult> {
+  async challengeDuel(
+    guildId: string,
+    challengerUserId: string,
+    targetUserId: string,
+    filtersOrNow: ProblemFilters | number = {},
+    maybeNow?: number
+  ): Promise<DuelChallengeResult> {
+    const filters = typeof filtersOrNow === "number" ? {} : filtersOrNow;
+    const now = typeof filtersOrNow === "number" ? filtersOrNow : maybeNow ?? nowSecond();
     if (challengerUserId === targetUserId) throw new Error("You cannot duel yourself.");
     this.store.expireStaleDuels(now);
     const challenger = this.store.getLinkedUserOrThrow(guildId, challengerUserId);
     const target = this.store.getLinkedUser(guildId, targetUserId);
     if (!target) throw new Error("That Discord user is not linked. They need to use /link first.");
-    if (this.store.findDuplicatePendingDuel(guildId, challengerUserId, targetUserId, now)) {
+    if (this.store.getPendingDuelBetweenUsers(guildId, challengerUserId, targetUserId, now)) {
       throw new Error("There is already a pending duel challenge between those users.");
     }
     if (this.store.getActiveDuelConflict(guildId, challengerUserId, targetUserId)) {
@@ -238,18 +246,20 @@ export class DiscordTrainingBotService {
       guildId,
       challengerUserId,
       targetUserId,
+      filters,
       challengedAt: now,
       expiresAt: now + DUEL_PENDING_TTL_SECONDS
     });
     return { duel, challenger, target };
   }
 
-  async acceptDuel(guildId: string, discordUserId: string, now = nowSecond(), duelId?: number): Promise<DuelAcceptResult> {
+  async acceptDuel(guildId: string, discordUserId: string, challengerUserId: string, now = nowSecond()): Promise<DuelAcceptResult> {
     this.store.expireStaleDuels(now);
-    const pending = duelId === undefined ? this.store.getOldestReceivedPendingDuel(guildId, discordUserId, now) : this.store.getDuel(duelId);
+    const pending = this.store.getPendingDuelBetweenUsers(guildId, discordUserId, challengerUserId, now);
     if (!pending || pending.guildId !== guildId || pending.status !== "pending" || pending.expiresAt === undefined || pending.expiresAt <= now) {
       throw new Error("That duel challenge is no longer pending.");
     }
+    if (pending.challengerUserId !== challengerUserId) throw new Error("Only the challenged user can accept this duel.");
     if (pending.targetUserId !== discordUserId) throw new Error("Only the challenged user can accept this duel.");
     if (this.store.getActiveDuelConflict(guildId, pending.challengerUserId, pending.targetUserId)) {
       throw new Error("One of those users is already in an active duel.");
@@ -259,8 +269,11 @@ export class DiscordTrainingBotService {
     const target = this.store.getLinkedUserOrThrow(guildId, pending.targetUserId);
     const challengerProfile = await this.ensureDuelProfile(challenger, now);
     const targetProfile = await this.ensureDuelProfile(target, now);
-    const dataset = await this.atcoder.getDataset(challenger.atcoderUsername);
-    const row = selectRandomProblem(dataset, { unsolvedOnly: true });
+    const [challengerDataset, targetDataset] = await Promise.all([
+      this.atcoder.getDataset(challenger.atcoderUsername),
+      this.atcoder.getDataset(target.atcoderUsername)
+    ]);
+    const row = selectRandomDuelProblem(challengerDataset, targetDataset, duelFiltersFromPending(pending));
     if (!row || row.difficulty === null) throw new Error("No duel problem is available right now.");
 
     const lowerRatedUserId = challengerProfile.duelRating <= targetProfile.duelRating ? challenger.discordUserId : target.discordUserId;
@@ -287,9 +300,9 @@ export class DiscordTrainingBotService {
     return { duel, challengerProfile, targetProfile };
   }
 
-  async denyDuel(guildId: string, discordUserId: string, now = nowSecond(), duelId?: number): Promise<DuelDenyResult> {
+  async denyDuel(guildId: string, discordUserId: string, otherUserId: string, now = nowSecond()): Promise<DuelDenyResult> {
     this.store.expireStaleDuels(now);
-    const pending = duelId === undefined ? this.store.getOldestReceivedPendingDuel(guildId, discordUserId, now) : this.store.getDuel(duelId);
+    const pending = this.store.getPendingDuelBetweenUsers(guildId, discordUserId, otherUserId, now);
     if (!pending || pending.guildId !== guildId || pending.status !== "pending" || pending.expiresAt === undefined || pending.expiresAt <= now) {
       throw new Error("That duel challenge is no longer pending.");
     }
@@ -436,6 +449,16 @@ export class DiscordTrainingBotService {
 
 function nowSecond(): number {
   return Math.floor(Date.now() / 1000);
+}
+
+function duelFiltersFromPending(duel: Duel): ProblemFilters {
+  return {
+    category: duel.filterCategory,
+    minDifficulty: duel.filterMinDifficulty,
+    maxDifficulty: duel.filterMaxDifficulty,
+    color: duel.filterColor,
+    unsolvedOnly: duel.filterAllowSolved !== true
+  };
 }
 
 function createLinkVerificationCode(): string {

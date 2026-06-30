@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { renderLineChart, renderStackedBarChart } from "../src/discord/charts";
-import { buildDiscordCommands, handleInteraction, shouldReplyEphemerally, trainingResolutionMessage } from "../src/discord/commands";
+import { buildDiscordCommands, handleInteraction, parseDifficultyRange, shouldReplyEphemerally, trainingResolutionMessage } from "../src/discord/commands";
 import { graphReply } from "../src/discord/graphs";
 import { graphsHelpMessage, leaderboardMessage, trainingHelpMessage } from "../src/discord/messages";
-import { selectRandomProblem, selectTrainingProblem } from "../src/discord/problem-selection";
+import { selectRandomDuelProblem, selectRandomProblem, selectTrainingProblem } from "../src/discord/problem-selection";
 import { pointsForDelta, reviewDelaySeconds, updateTrainingRating } from "../src/discord/scoring";
 import { DiscordTrainingBotService } from "../src/discord/service";
 import { DiscordBotStore } from "../src/discord/storage";
@@ -16,18 +16,21 @@ const dataset: AtCoderDataset = {
   contests: [
     { id: "abc100", title: "ABC 100", start_epoch_second: 1_600_000_000 },
     { id: "abc250", title: "ABC 250", start_epoch_second: 1_650_000_000 },
+    { id: "adt_all_20231220", title: "AtCoder Daily Training ALL 2023/12/20", start_epoch_second: 1_655_000_000 },
     { id: "arc120", title: "ARC 120", start_epoch_second: 1_660_000_000 },
     { id: "agc050", title: "AGC 050", start_epoch_second: 1_670_000_000 }
   ],
   problems: [
     { id: "abc100_a", contest_id: "abc100", title: "Gray" },
     { id: "abc250_c", contest_id: "abc250", title: "Green" },
+    { id: "adt_all_20231220_c", contest_id: "adt_all_20231220", title: "ADT Green" },
     { id: "arc120_b", contest_id: "arc120", title: "Cyan" },
     { id: "agc050_a", contest_id: "agc050", title: "Blue" }
   ],
   models: {
     abc100_a: { difficulty: 300 },
     abc250_c: { difficulty: 900 },
+    adt_all_20231220_c: { difficulty: 850 },
     arc120_b: { difficulty: 1300 },
     agc050_a: { difficulty: 1700 }
   },
@@ -60,6 +63,64 @@ describe("Discord bot domain", () => {
       unsolvedOnly: true
     }, 0);
     expect(row?.problem.id).toBe("abc250_c");
+  });
+
+  it("parses open-ended and bounded difficulty ranges", () => {
+    expect(parseDifficultyRange("1400-")).toEqual({ minDifficulty: 1400, maxDifficulty: undefined });
+    expect(parseDifficultyRange("-1400")).toEqual({ minDifficulty: undefined, maxDifficulty: 1400 });
+    expect(parseDifficultyRange(" 1400 - 1600 ")).toEqual({ minDifficulty: 1400, maxDifficulty: 1600 });
+    expect(() => parseDifficultyRange("1600-1400")).toThrow(/minimum/);
+    expect(() => parseDifficultyRange("1400")).toThrow(/Difficulty range/);
+  });
+
+  it("filters Discord categories with ABC absorbing ADT", () => {
+    expect(selectRandomProblem(dataset, { category: "ABC", minDifficulty: 800, maxDifficulty: 899 }, 0)?.problem.id)
+      .toBe("adt_all_20231220_c");
+    expect(selectRandomProblem(dataset, { category: "ARC" }, 0)?.problem.id).toBe("arc120_b");
+    expect(selectRandomProblem(dataset, { category: "AGC" }, 0)?.problem.id).toBe("agc050_a");
+  });
+
+  it("defaults random problem filters to unsolved and can allow solved problems", async () => {
+    const store = new DiscordBotStore(":memory:");
+    const service = new DiscordTrainingBotService(store, fakeAtCoder(true));
+    await linkForTest(service, "guild", "1", "tourist", 1_700_000_000);
+
+    await expect(service.gimme("guild", "1", {
+      category: "ABC",
+      maxDifficulty: 399,
+      unsolvedOnly: true
+    }, 1_700_000_100)).rejects.toThrow(/No problem matched/);
+
+    const solved = await service.gimme("guild", "1", {
+      category: "ABC",
+      maxDifficulty: 399,
+      unsolvedOnly: false
+    }, 1_700_000_100);
+
+    expect(solved.problemId).toBe("abc100_a");
+    store.close();
+  });
+
+  it("excludes problems solved by either duelist by default", () => {
+    const targetDataset: AtCoderDataset = {
+      ...dataset,
+      submissions: [
+        { id: 2, epoch_second: 1_700_000_001, problem_id: "abc250_c", contest_id: "abc250", user_id: "benq", result: "AC" }
+      ]
+    };
+
+    expect(selectRandomDuelProblem(dataset, targetDataset, {
+      category: "ABC",
+      minDifficulty: 900,
+      maxDifficulty: 900,
+      unsolvedOnly: true
+    }, 0)).toBeNull();
+    expect(selectRandomDuelProblem(dataset, targetDataset, {
+      category: "ABC",
+      minDifficulty: 900,
+      maxDifficulty: 900,
+      unsolvedOnly: false
+    }, 0)?.problem.id).toBe("abc250_c");
   });
 
   it("selects adaptive training problems near the requested delta", () => {
@@ -479,7 +540,7 @@ describe("Discord bot service", () => {
     expect(challenge.duel.status).toBe("pending");
     await expect(service.challengeDuel("guild", "2", "1", 1_700_000_110)).rejects.toThrow(/already a pending/);
 
-    const accepted = await service.acceptDuel("guild", "2", 1_700_000_120, challenge.duel.id);
+    const accepted = await service.acceptDuel("guild", "2", "1", 1_700_000_120);
     expect(accepted.duel.status).toBe("active");
     expect(accepted.duel.challengerHandle).toBe("tourist");
     expect(accepted.duel.targetHandle).toBe("benq");
@@ -491,21 +552,77 @@ describe("Discord bot service", () => {
     store.close();
   });
 
-  it("lets slash fallbacks deny the oldest received duel and expires stale pending challenges", async () => {
+  it("denies the selected received duel and expires stale pending challenges", async () => {
     const store = new DiscordBotStore(":memory:");
     const service = new DiscordTrainingBotService(store, fakeDuelAtCoder({}));
     await linkForTest(service, "guild", "1", "tourist", 1_700_000_000);
     await linkForTest(service, "guild", "2", "benq", 1_700_000_000);
     await linkForTest(service, "guild", "3", "rng58", 1_700_000_000);
 
-    const stale = await service.challengeDuel("guild", "1", "2", 1_700_000_100);
-    await expect(service.acceptDuel("guild", "2", 1_700_001_001, stale.duel.id)).rejects.toThrow(/no longer pending/);
+    await service.challengeDuel("guild", "1", "2", 1_700_000_100);
+    await expect(service.acceptDuel("guild", "2", "1", 1_700_001_001)).rejects.toThrow(/no longer pending/);
 
     const first = await service.challengeDuel("guild", "1", "2", 1_700_001_100);
     await service.challengeDuel("guild", "3", "2", 1_700_001_110);
-    const denied = await service.denyDuel("guild", "2", 1_700_001_120);
+    const denied = await service.denyDuel("guild", "2", "1", 1_700_001_120);
     expect(denied.duel.id).toBe(first.duel.id);
     expect(denied.duel.status).toBe("declined");
+    store.close();
+  });
+
+  it("accepts only the selected challenger for slash-command duel invites", async () => {
+    const store = new DiscordBotStore(":memory:");
+    const service = new DiscordTrainingBotService(store, fakeDuelAtCoder({}));
+    await linkForTest(service, "guild", "1", "tourist", 1_700_000_000);
+    await linkForTest(service, "guild", "2", "benq", 1_700_000_000);
+    await linkForTest(service, "guild", "3", "rng58", 1_700_000_000);
+
+    const challenge = await service.challengeDuel("guild", "1", "2", 1_700_000_100);
+    await expect(service.acceptDuel("guild", "2", "3", 1_700_000_120)).rejects.toThrow(/no longer pending/);
+    await expect(service.acceptDuel("guild", "1", "2", 1_700_000_120)).rejects.toThrow(/challenged user/);
+
+    const accepted = await service.acceptDuel("guild", "2", "1", 1_700_000_120);
+    expect(accepted.duel.id).toBe(challenge.duel.id);
+    expect(accepted.duel.status).toBe("active");
+    store.close();
+  });
+
+  it("persists duel challenge filters and requires unsolved problems for both users by default", async () => {
+    const store = new DiscordBotStore(":memory:");
+    const targetDataset: AtCoderDataset = {
+      ...dataset,
+      submissions: [
+        { id: 2, epoch_second: 1_700_000_001, problem_id: "abc250_c", contest_id: "abc250", user_id: "benq", result: "AC" }
+      ]
+    };
+    const service = new DiscordTrainingBotService(store, fakeDuelAtCoder({}, {}, { tourist: dataset, benq: targetDataset }));
+    await linkForTest(service, "guild", "1", "tourist", 1_700_000_000);
+    await linkForTest(service, "guild", "2", "benq", 1_700_000_000);
+
+    const blocked = await service.challengeDuel("guild", "1", "2", {
+      category: "ABC",
+      minDifficulty: 900,
+      maxDifficulty: 900,
+      unsolvedOnly: true
+    }, 1_700_000_100);
+
+    expect(blocked.duel.filterCategory).toBe("ABC");
+    expect(blocked.duel.filterMinDifficulty).toBe(900);
+    expect(blocked.duel.filterMaxDifficulty).toBe(900);
+    expect(blocked.duel.filterAllowSolved).toBe(false);
+    await expect(service.acceptDuel("guild", "2", "1", 1_700_000_120)).rejects.toThrow(/No duel problem/);
+    await service.denyDuel("guild", "2", "1", 1_700_000_130);
+
+    await service.challengeDuel("guild", "1", "2", {
+      category: "ABC",
+      minDifficulty: 900,
+      maxDifficulty: 900,
+      unsolvedOnly: false
+    }, 1_700_000_140);
+    const accepted = await service.acceptDuel("guild", "2", "1", 1_700_000_160);
+
+    expect(accepted.duel.problemId).toBe("abc250_c");
+    expect(accepted.duel.filterAllowSolved).toBe(true);
     store.close();
   });
 
@@ -519,7 +636,7 @@ describe("Discord bot service", () => {
     await linkForTest(service, "guild", "1", "tourist", 1_700_000_000);
     await linkForTest(service, "guild", "2", "benq", 1_700_000_000);
     const challenge = await service.challengeDuel("guild", "1", "2", 1_700_000_100);
-    const accepted = await service.acceptDuel("guild", "2", 1_700_000_200, challenge.duel.id);
+    const accepted = await service.acceptDuel("guild", "2", "1", 1_700_000_200);
 
     await expect(service.verifyDuel("guild", "1", 1_700_000_250)).resolves.toMatchObject({
       status: "active",
@@ -551,7 +668,7 @@ describe("Discord bot service", () => {
     await linkForTest(service, "guild", "1", "tourist", 1_700_000_000);
     await linkForTest(service, "guild", "2", "benq", 1_700_000_000);
     const challenge = await service.challengeDuel("guild", "1", "2", 1_700_000_100);
-    const accepted = await service.acceptDuel("guild", "2", 1_700_000_200, challenge.duel.id);
+    const accepted = await service.acceptDuel("guild", "2", "1", 1_700_000_200);
 
     submissions.benq = [submission("benq", accepted.duel, "Judging", 1_700_000_240)];
     await expect(service.verifyDuel("guild", "1", 1_700_000_250)).resolves.toMatchObject({ status: "pending_judgement" });
@@ -568,7 +685,10 @@ describe("Discord bot service", () => {
     const commands = buildDiscordCommands();
     expect(commands.map((command) => command.name)).toEqual(["help", "link", "gimme", "train", "duel", "graphs"]);
     const gimme = commands.find((command) => command.name === "gimme");
-    expect(gimme?.options?.map((option) => option.name)).toEqual(["min", "max", "color", "unsolved_only"]);
+    expect(gimme?.options?.map((option) => option.name)).toEqual(["category", "range", "color", "allow_solved"]);
+    const gimmeCategory = gimme?.options?.find((option) => option.name === "category");
+    expect(gimmeCategory && "choices" in gimmeCategory ? gimmeCategory.choices?.map((choice) => choice.value) : undefined)
+      .toEqual(["ABC", "ARC", "AGC"]);
     const train = commands.find((command) => command.name === "train");
     expect(train?.options?.map((option) => option.name)).toEqual([
       "help",
@@ -592,6 +712,18 @@ describe("Discord bot service", () => {
     const graphs = commands.find((command) => command.name === "graphs");
     const duel = commands.find((command) => command.name === "duel");
     expect(duel?.options?.map((option) => option.name)).toEqual(["challenge", "accept", "deny", "status", "verify", "history"]);
+    const duelChallenge = duel?.options?.find((option) => option.name === "challenge");
+    const duelChallengeOptions = duelChallenge && "options" in duelChallenge ? duelChallenge.options : undefined;
+    expect(duelChallengeOptions?.map((option) => option.name)).toEqual(["user", "category", "range", "color", "allow_solved"]);
+    const duelCategory = duelChallengeOptions?.find((option) => option.name === "category");
+    expect(duelCategory && "choices" in duelCategory ? duelCategory.choices?.map((choice) => choice.value) : undefined)
+      .toEqual(["ABC", "ARC", "AGC"]);
+    const duelAccept = duel?.options?.find((option) => option.name === "accept");
+    const duelAcceptOptions = duelAccept && "options" in duelAccept ? duelAccept.options : undefined;
+    expect(duelAcceptOptions?.map((option) => option.name)).toEqual(["user"]);
+    const duelDeny = duel?.options?.find((option) => option.name === "deny");
+    const duelDenyOptions = duelDeny && "options" in duelDeny ? duelDeny.options : undefined;
+    expect(duelDenyOptions?.map((option) => option.name)).toEqual(["user"]);
     expect(graphs?.options?.map((option) => option.name)).toEqual(["help", "official", "training", "points", "solved"]);
     for (const subcommand of graphs?.options ?? []) {
       if (subcommand.name === "help" || subcommand.name === "solved") continue;
@@ -683,6 +815,76 @@ describe("Discord bot service", () => {
     expect(events).toEqual(["defer:false", "service", "edit"]);
   });
 
+  it("accepts selected duel invites through public slash commands", async () => {
+    const events: string[] = [];
+    const service = {
+      acceptDuel: async (guildId: string, discordUserId: string, challengerUserId: string) => {
+        events.push(`${guildId}:${discordUserId}:${challengerUserId}`);
+        return {
+          duel: {
+            id: 1,
+            guildId,
+            challengerUserId,
+            targetUserId: discordUserId,
+            status: "active",
+            challengedAt: 1,
+            acceptedAt: 2,
+            expiresAt: 3,
+            contestId: "abc250",
+            problemId: "abc250_c",
+            title: "Green",
+            difficulty: 900
+          }
+        };
+      }
+    } as unknown as DiscordTrainingBotService;
+    const interaction = fakeChatInputInteraction("duel", "accept", events, fakeUser("2"));
+
+    await handleInteraction(interaction, service, {} as DiscordBotStore);
+
+    expect(events).toEqual(["defer:false", "guild:1:2", "edit"]);
+  });
+
+  it("denies selected duel invites through public slash commands", async () => {
+    const events: string[] = [];
+    const service = {
+      denyDuel: async (guildId: string, discordUserId: string, otherUserId: string) => {
+        events.push(`${guildId}:${discordUserId}:${otherUserId}`);
+        return {
+          duel: {
+            id: 1,
+            guildId,
+            challengerUserId: otherUserId,
+            targetUserId: discordUserId,
+            status: "declined",
+            challengedAt: 1,
+            declinedAt: 2
+          }
+        };
+      }
+    } as unknown as DiscordTrainingBotService;
+    const interaction = fakeChatInputInteraction("duel", "deny", events, fakeUser("2"));
+
+    await handleInteraction(interaction, service, {} as DiscordBotStore);
+
+    expect(events).toEqual(["defer:false", "guild:1:2", "edit"]);
+  });
+
+  it("keeps duel slash command errors public", async () => {
+    const events: string[] = [];
+    const service = {
+      getDuelStatus: () => {
+        events.push("service");
+        throw new Error("No duel here.");
+      }
+    } as unknown as DiscordTrainingBotService;
+    const interaction = fakeChatInputInteraction("duel", "status", events);
+
+    await handleInteraction(interaction, service, {} as DiscordBotStore);
+
+    expect(events).toEqual(["service", "reply:false"]);
+  });
+
   it("defers training buttons before resolving assignments", async () => {
     const events: string[] = [];
     const service = {
@@ -718,34 +920,18 @@ describe("Discord bot service", () => {
     expect(events).toEqual(["defer:true", "service", "edit"]);
   });
 
-  it("defers duel buttons before accepting challenges", async () => {
+  it("disables legacy duel buttons with public slash-command guidance", async () => {
     const events: string[] = [];
     const service = {
       acceptDuel: async () => {
         events.push("service");
-        return {
-          duel: {
-            id: 1,
-            guildId: "guild",
-            challengerUserId: "1",
-            targetUserId: "2",
-            status: "active",
-            challengedAt: 1,
-            acceptedAt: 2,
-            expiresAt: 3,
-            contestId: "abc250",
-            problemId: "abc250_c",
-            title: "Green",
-            difficulty: 900
-          }
-        };
       }
     } as unknown as DiscordTrainingBotService;
     const interaction = fakeButtonInteraction("duel:accept:1", events);
 
     await handleInteraction(interaction, service, {} as DiscordBotStore);
 
-    expect(events).toEqual(["defer:true", "service", "edit"]);
+    expect(events).toEqual(["reply:false"]);
   });
 
   it("renders the server leaderboard as a ranked table", () => {
@@ -877,12 +1063,16 @@ function fakeAtCoder(solved: boolean | (() => boolean), history: OfficialRatingP
   } as unknown as DiscordAtCoderService;
 }
 
-function fakeDuelAtCoder(submissions: Record<string, Submission[]>, ratings: Record<string, number> = {}): DiscordAtCoderService {
+function fakeDuelAtCoder(
+  submissions: Record<string, Submission[]>,
+  ratings: Record<string, number> = {},
+  datasets: Record<string, AtCoderDataset> = {}
+): DiscordAtCoderService {
   return {
     getInitialRating: async (username: string) => ratings[username] ?? 1200,
     getInitialDuelRating: async (username: string) => ratings[username] ?? 1200,
     getRatingHistory: async (username: string) => [{ epochSecond: 1, rating: ratings[username] ?? 1200, contestName: "ABC" }],
-    getDataset: async () => dataset,
+    getDataset: async (username: string) => datasets[username] ?? dataset,
     hasProfileVerificationCode: async () => true,
     hasAcceptedSubmission: async () => false,
     hasSubmissionResult: async () => false,
@@ -925,12 +1115,13 @@ function fakeChatInputInteraction(commandName: string, subcommand: string | null
       events.push(`defer:${options.ephemeral === true}`);
       fake.deferred = true;
     },
-    editReply: async () => {
+    editReply: async (response?: { components?: unknown[] }) => {
+      if (response?.components && response.components.length > 0) events.push("components");
       events.push("edit");
       fake.replied = true;
     },
-    reply: async () => {
-      events.push("reply");
+    reply: async (options?: { ephemeral?: boolean }) => {
+      events.push(`reply:${options?.ephemeral === true}`);
       fake.replied = true;
     },
     followUp: async () => {
@@ -953,12 +1144,13 @@ function fakeButtonInteraction(customId: string, events: string[]) {
       events.push(`defer:${options.ephemeral === true}`);
       fake.deferred = true;
     },
-    editReply: async () => {
+    editReply: async (response?: { components?: unknown[] }) => {
+      if (response?.components && response.components.length > 0) events.push("components");
       events.push("edit");
       fake.replied = true;
     },
-    reply: async () => {
-      events.push("reply");
+    reply: async (options?: { ephemeral?: boolean }) => {
+      events.push(`reply:${options?.ephemeral === true}`);
       fake.replied = true;
     },
     followUp: async () => {

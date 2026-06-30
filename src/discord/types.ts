@@ -94,6 +94,7 @@ export interface ProblemFilters {
   minDifficulty?: number | undefined;
   maxDifficulty?: number | undefined;
   color?: DifficultyColor | undefined;
+  category?: ProblemCategory | undefined;
   categories?: ContestType[] | undefined;
   contestId?: string | undefined;
   contestNumberMin?: number | undefined;
@@ -104,6 +105,7 @@ export interface ProblemFilters {
 }
 
 export type DifficultyColor = "gray" | "brown" | "green" | "cyan" | "blue" | "yellow" | "orange" | "red";
+export type ProblemCategory = "ABC" | "ARC" | "AGC";
 
 export interface SelectedProblem {
   row: ProblemRow;
@@ -155,4 +157,9 @@ export interface Duel {
   winnerUserId?: string | undefined;
   challengerSolvedAt?: number | undefined;
   targetSolvedAt?: number | undefined;
+  filterCategory?: ProblemCategory | undefined;
+  filterMinDifficulty?: number | undefined;
+  filterMaxDifficulty?: number | undefined;
+  filterColor?: DifficultyColor | undefined;
+  filterAllowSolved?: boolean | undefined;
 }
