@@ -601,28 +601,29 @@ describe("Discord bot service", () => {
     }
   });
 
-  it("keeps requested personal Discord surfaces ephemeral while public progress remains public", () => {
-    expect(shouldReplyEphemerally("gimme")).toBe(true);
+  it("keeps private Discord surfaces ephemeral while normal activity remains public", () => {
+    expect(shouldReplyEphemerally("help")).toBe(true);
     expect(shouldReplyEphemerally("link")).toBe(true);
     expect(shouldReplyEphemerally("train", "help")).toBe(true);
-    expect(shouldReplyEphemerally("train", "start")).toBe(true);
-    expect(shouldReplyEphemerally("train", "current")).toBe(true);
-    expect(shouldReplyEphemerally("train", "completed")).toBe(true);
-    expect(shouldReplyEphemerally("train", "assisted")).toBe(true);
-    expect(shouldReplyEphemerally("train", "skip")).toBe(true);
-    expect(shouldReplyEphemerally("train", "verify")).toBe(true);
     expect(shouldReplyEphemerally("train", "queue")).toBe(true);
-    expect(shouldReplyEphemerally("train", "review")).toBe(true);
-    expect(shouldReplyEphemerally("duel", "accept")).toBe(true);
-    expect(shouldReplyEphemerally("duel", "deny")).toBe(true);
-    expect(shouldReplyEphemerally("duel", "verify")).toBe(true);
+    expect(shouldReplyEphemerally("graphs", "help")).toBe(true);
 
+    expect(shouldReplyEphemerally("gimme")).toBe(false);
+    expect(shouldReplyEphemerally("train", "start")).toBe(false);
+    expect(shouldReplyEphemerally("train", "current")).toBe(false);
+    expect(shouldReplyEphemerally("train", "completed")).toBe(false);
+    expect(shouldReplyEphemerally("train", "assisted")).toBe(false);
+    expect(shouldReplyEphemerally("train", "skip")).toBe(false);
+    expect(shouldReplyEphemerally("train", "verify")).toBe(false);
+    expect(shouldReplyEphemerally("train", "review")).toBe(false);
     expect(shouldReplyEphemerally("train", "status")).toBe(false);
     expect(shouldReplyEphemerally("train", "leaderboard")).toBe(false);
     expect(shouldReplyEphemerally("duel", "challenge")).toBe(false);
+    expect(shouldReplyEphemerally("duel", "accept")).toBe(false);
+    expect(shouldReplyEphemerally("duel", "deny")).toBe(false);
     expect(shouldReplyEphemerally("duel", "status")).toBe(false);
+    expect(shouldReplyEphemerally("duel", "verify")).toBe(false);
     expect(shouldReplyEphemerally("duel", "history")).toBe(false);
-    expect(shouldReplyEphemerally("graphs", "help")).toBe(true);
     expect(shouldReplyEphemerally("graphs", "training")).toBe(false);
   });
 
@@ -652,7 +653,7 @@ describe("Discord bot service", () => {
 
     await handleInteraction(interaction, service, {} as DiscordBotStore);
 
-    expect(events).toEqual(["defer:true", "service", "edit"]);
+    expect(events).toEqual(["defer:false", "service", "edit"]);
   });
 
   it("defers duel slash commands and routes challenge work", async () => {

@@ -136,19 +136,10 @@ export async function handleInteraction(interaction: Interaction, service: Disco
 }
 
 export function shouldReplyEphemerally(commandName: string, subcommand?: string): boolean {
-  if (commandName === "link" || commandName === "gimme") return true;
-  if (commandName === "graphs" && subcommand === "help") return true;
-  if (commandName === "duel") return subcommand === "accept" || subcommand === "deny" || subcommand === "verify";
+  if (commandName === "link" || commandName === "help") return true;
+  if (subcommand === "help") return true;
   if (commandName !== "train") return false;
-  return subcommand === "help" ||
-    subcommand === "start" ||
-    subcommand === "current" ||
-    subcommand === "completed" ||
-    subcommand === "assisted" ||
-    subcommand === "skip" ||
-    subcommand === "verify" ||
-    subcommand === "queue" ||
-    subcommand === "review";
+  return subcommand === "queue";
 }
 
 async function routeCommand(interaction: ChatInputCommandInteraction, service: DiscordTrainingBotService, store: DiscordBotStore): Promise<void> {
