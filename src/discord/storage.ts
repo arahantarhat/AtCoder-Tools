@@ -14,6 +14,7 @@ import type {
   LinkedUser,
   MonthlyPoints,
   PendingLinkChallenge,
+  PracticeProblem,
   ProblemFilters,
   ScoreReason,
   ReviewQueueItem,
@@ -443,6 +444,100 @@ export class DiscordBotStore implements CacheStore {
     this.db.prepare("UPDATE review_queue SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL").run(now, id);
   }
 
+  addPracticeProblem(input: {
+    guildId: string;
+    discordUserId: string;
+    name: string;
+    url: string;
+    note?: string | undefined;
+    createdAt: number;
+  }): PracticeProblem {
+    const position = this.nextPracticePosition(input.guildId, input.discordUserId);
+    const result = this.db.prepare(`
+      INSERT INTO practice_queue (guild_id, discord_user_id, name, url, note, position, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.guildId,
+      input.discordUserId,
+      input.name,
+      input.url,
+      input.note ?? null,
+      position,
+      input.createdAt
+    );
+    return this.getPracticeProblem(Number(result.lastInsertRowid))!;
+  }
+
+  getCurrentPracticeProblem(guildId: string, discordUserId: string): PracticeProblem | null {
+    const row = this.db.prepare(`
+      SELECT * FROM practice_queue
+      WHERE guild_id = ? AND discord_user_id = ? AND completed_at IS NULL
+      ORDER BY position ASC, id ASC
+      LIMIT 1
+    `).get(guildId, discordUserId) as Row | undefined;
+    return row ? practiceProblemFromRow(row) : null;
+  }
+
+  listPracticeQueue(guildId: string, discordUserId: string, limit = 10): PracticeProblem[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM practice_queue
+      WHERE guild_id = ? AND discord_user_id = ? AND completed_at IS NULL
+      ORDER BY position ASC, id ASC
+      LIMIT ?
+    `).all(guildId, discordUserId, limit) as Row[];
+    return rows.map(practiceProblemFromRow);
+  }
+
+  startPracticeProblem(guildId: string, discordUserId: string, now: number): PracticeProblem | null {
+    const current = this.getCurrentPracticeProblem(guildId, discordUserId);
+    if (!current) return null;
+    if (current.startedAt === undefined) {
+      this.db.prepare("UPDATE practice_queue SET started_at = ? WHERE id = ? AND started_at IS NULL")
+        .run(now, current.id);
+    }
+    return this.getPracticeProblem(current.id);
+  }
+
+  completeCurrentPracticeProblem(guildId: string, discordUserId: string, now: number): PracticeProblem | null {
+    const current = this.getCurrentPracticeProblem(guildId, discordUserId);
+    if (!current) return null;
+    this.db.prepare("UPDATE practice_queue SET completed_at = ? WHERE id = ? AND completed_at IS NULL")
+      .run(now, current.id);
+    return this.getPracticeProblem(current.id);
+  }
+
+  moveCurrentPracticeProblemToBack(guildId: string, discordUserId: string): PracticeProblem | null {
+    const current = this.getCurrentPracticeProblem(guildId, discordUserId);
+    if (!current) return null;
+    const position = this.nextPracticePosition(guildId, discordUserId);
+    this.db.prepare("UPDATE practice_queue SET position = ? WHERE id = ? AND completed_at IS NULL")
+      .run(position, current.id);
+    return this.getPracticeProblem(current.id);
+  }
+
+  appendCurrentPracticeNote(guildId: string, discordUserId: string, note: string): PracticeProblem | null {
+    const current = this.getCurrentPracticeProblem(guildId, discordUserId);
+    if (!current) return null;
+    const nextNote = current.note ? `${current.note}\n${note}` : note;
+    this.db.prepare("UPDATE practice_queue SET note = ? WHERE id = ? AND completed_at IS NULL")
+      .run(nextNote, current.id);
+    return this.getPracticeProblem(current.id);
+  }
+
+  private getPracticeProblem(id: number): PracticeProblem | null {
+    const row = this.db.prepare("SELECT * FROM practice_queue WHERE id = ?").get(id) as Row | undefined;
+    return row ? practiceProblemFromRow(row) : null;
+  }
+
+  private nextPracticePosition(guildId: string, discordUserId: string): number {
+    const row = this.db.prepare(`
+      SELECT COALESCE(MAX(position), 0) + 1 AS position
+      FROM practice_queue
+      WHERE guild_id = ? AND discord_user_id = ? AND completed_at IS NULL
+    `).get(guildId, discordUserId) as Row | undefined;
+    return Number(row?.position ?? 1);
+  }
+
   getDuelProfile(guildId: string, discordUserId: string): DuelProfile | null {
     const row = this.db.prepare("SELECT * FROM duel_profiles WHERE guild_id = ? AND discord_user_id = ?")
       .get(guildId, discordUserId) as Row | undefined;
@@ -858,6 +953,22 @@ export class DiscordBotStore implements CacheStore {
       CREATE INDEX IF NOT EXISTS ix_review_queue_due
       ON review_queue (guild_id, discord_user_id, consumed_at, available_after);
 
+      CREATE TABLE IF NOT EXISTS practice_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT NOT NULL,
+        discord_user_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        url TEXT NOT NULL,
+        note TEXT,
+        position INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        started_at INTEGER,
+        completed_at INTEGER
+      );
+
+      CREATE INDEX IF NOT EXISTS ix_practice_queue_open
+      ON practice_queue (guild_id, discord_user_id, completed_at, position);
+
       CREATE TABLE IF NOT EXISTS cached_json (
         cache_key TEXT PRIMARY KEY,
         fetched_at INTEGER NOT NULL,
@@ -939,6 +1050,21 @@ function reviewItemFromRow(row: Row): ReviewQueueItem {
     availableAfter: Number(row.available_after),
     createdAt: Number(row.created_at),
     consumedAt: row.consumed_at === null ? undefined : Number(row.consumed_at)
+  };
+}
+
+function practiceProblemFromRow(row: Row): PracticeProblem {
+  return {
+    id: Number(row.id),
+    guildId: String(row.guild_id),
+    discordUserId: String(row.discord_user_id),
+    name: String(row.name),
+    url: String(row.url),
+    note: optionalString(row.note),
+    position: Number(row.position),
+    createdAt: Number(row.created_at),
+    startedAt: optionalNumber(row.started_at),
+    completedAt: optionalNumber(row.completed_at)
   };
 }
 

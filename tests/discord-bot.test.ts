@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { renderLineChart, renderStackedBarChart } from "../src/discord/charts";
 import { buildDiscordCommands, handleInteraction, parseDifficultyRange, shouldReplyEphemerally, trainingResolutionMessage } from "../src/discord/commands";
 import { graphReply } from "../src/discord/graphs";
-import { graphsHelpMessage, leaderboardMessage, trainingHelpMessage } from "../src/discord/messages";
+import { graphsHelpMessage, helpMessage, leaderboardMessage, practiceHelpMessage, trainingHelpMessage } from "../src/discord/messages";
 import { selectRandomDuelProblem, selectRandomProblem, selectTrainingProblem } from "../src/discord/problem-selection";
 import { pointsForDelta, reviewDelaySeconds, updateTrainingRating } from "../src/discord/scoring";
 import { DiscordTrainingBotService } from "../src/discord/service";
@@ -45,9 +45,13 @@ describe("Discord bot domain", () => {
   });
 
   it("moves training rating by outcome", () => {
-    expect(updateTrainingRating(1000, "completed", 0)).toBeGreaterThan(1000);
-    expect(updateTrainingRating(1000, "assisted", 0)).toBeLessThan(1000);
-    expect(updateTrainingRating(1000, "skipped", 0)).toBeLessThan(updateTrainingRating(1000, "assisted", 0));
+    const deltas = [-300, -200, -100, 0, 100, 200, 300];
+    expect(deltas.map((delta) => updateTrainingRating(1000, "completed", delta) - 1000))
+      .toEqual([20, 30, 40, 50, 60, 70, 80]);
+    expect(deltas.map((delta) => updateTrainingRating(1000, "assisted", delta) - 1000))
+      .toEqual([-65, -55, -45, -35, -25, -15, -5]);
+    expect(deltas.map((delta) => updateTrainingRating(1000, "skipped", delta) - 1000))
+      .toEqual([-100, -90, -80, -70, -60, -50, -40]);
   });
 
   it("uses UTC month keys", () => {
@@ -425,6 +429,41 @@ describe("Discord bot service", () => {
     store.close();
   });
 
+  it("manages a simple practice FIFO queue with notes on the current problem only", () => {
+    const store = new DiscordBotStore(":memory:");
+    const service = new DiscordTrainingBotService(store, fakeAtCoder(true));
+
+    const first = service.addPracticeProblem("guild", "1", "https://example.com/a", "A", "initial", 1_700_000_000);
+    const second = service.addPracticeProblem("guild", "1", "https://example.com/b", "B", undefined, 1_700_000_001);
+
+    expect(service.startPracticeProblem("guild", "1", 1_700_000_010)).toMatchObject({
+      id: first.id,
+      startedAt: 1_700_000_010
+    });
+    expect(service.addCurrentPracticeNote("guild", "1", "stuck on invariant")).toMatchObject({
+      id: first.id,
+      note: "initial\nstuck on invariant"
+    });
+    expect(store.listPracticeQueue("guild", "1").map((problem) => [problem.id, problem.note])).toEqual([
+      [first.id, "initial\nstuck on invariant"],
+      [second.id, undefined]
+    ]);
+
+    service.moveCurrentPracticeProblemToBack("guild", "1");
+    expect(service.addCurrentPracticeNote("guild", "1", "try greedy")).toMatchObject({
+      id: second.id,
+      note: "try greedy"
+    });
+    expect(store.listPracticeQueue("guild", "1").map((problem) => problem.id)).toEqual([second.id, first.id]);
+
+    expect(service.completeCurrentPracticeProblem("guild", "1", 1_700_000_020)).toMatchObject({
+      id: second.id,
+      completedAt: 1_700_000_020
+    });
+    expect(store.listPracticeQueue("guild", "1").map((problem) => problem.id)).toEqual([first.id]);
+    store.close();
+  });
+
   it("does not let /gimme block a later training assignment", async () => {
     const store = new DiscordBotStore(":memory:");
     const service = new DiscordTrainingBotService(store, fakeAtCoder(true));
@@ -683,7 +722,7 @@ describe("Discord bot service", () => {
 
   it("exposes the V1 slash commands including help", () => {
     const commands = buildDiscordCommands();
-    expect(commands.map((command) => command.name)).toEqual(["help", "link", "gimme", "train", "duel", "graphs"]);
+    expect(commands.map((command) => command.name)).toEqual(["help", "link", "gimme", "train", "duel", "practice", "graphs"]);
     const gimme = commands.find((command) => command.name === "gimme");
     expect(gimme?.options?.map((option) => option.name)).toEqual(["category", "range", "color", "allow_solved"]);
     const gimmeCategory = gimme?.options?.find((option) => option.name === "category");
@@ -711,6 +750,7 @@ describe("Discord bot service", () => {
     expect(leaderboardOptions?.map((option) => option.name)).toEqual(["month", "period"]);
     const graphs = commands.find((command) => command.name === "graphs");
     const duel = commands.find((command) => command.name === "duel");
+    const practice = commands.find((command) => command.name === "practice");
     expect(duel?.options?.map((option) => option.name)).toEqual(["challenge", "accept", "deny", "status", "verify", "history"]);
     const duelChallenge = duel?.options?.find((option) => option.name === "challenge");
     const duelChallengeOptions = duelChallenge && "options" in duelChallenge ? duelChallenge.options : undefined;
@@ -724,6 +764,13 @@ describe("Discord bot service", () => {
     const duelDeny = duel?.options?.find((option) => option.name === "deny");
     const duelDenyOptions = duelDeny && "options" in duelDeny ? duelDeny.options : undefined;
     expect(duelDenyOptions?.map((option) => option.name)).toEqual(["user"]);
+    expect(practice?.options?.map((option) => option.name)).toEqual(["help", "add", "start", "later", "complete", "note", "list"]);
+    const practiceAdd = practice?.options?.find((option) => option.name === "add");
+    const practiceAddOptions = practiceAdd && "options" in practiceAdd ? practiceAdd.options : undefined;
+    expect(practiceAddOptions?.map((option) => option.name)).toEqual(["link", "name", "note"]);
+    const practiceNote = practice?.options?.find((option) => option.name === "note");
+    const practiceNoteOptions = practiceNote && "options" in practiceNote ? practiceNote.options : undefined;
+    expect(practiceNoteOptions?.map((option) => option.name)).toEqual(["text"]);
     expect(graphs?.options?.map((option) => option.name)).toEqual(["help", "official", "training", "points", "solved"]);
     for (const subcommand of graphs?.options ?? []) {
       if (subcommand.name === "help" || subcommand.name === "solved") continue;
@@ -736,6 +783,9 @@ describe("Discord bot service", () => {
   it("keeps private Discord surfaces ephemeral while normal activity remains public", () => {
     expect(shouldReplyEphemerally("help")).toBe(true);
     expect(shouldReplyEphemerally("link")).toBe(true);
+    expect(shouldReplyEphemerally("practice", "add")).toBe(true);
+    expect(shouldReplyEphemerally("practice", "note")).toBe(true);
+    expect(shouldReplyEphemerally("practice", "list")).toBe(true);
     expect(shouldReplyEphemerally("train", "help")).toBe(true);
     expect(shouldReplyEphemerally("train", "queue")).toBe(true);
     expect(shouldReplyEphemerally("graphs", "help")).toBe(true);
@@ -946,14 +996,25 @@ describe("Discord bot service", () => {
     expect(message).toContain("2  <@2>  benq        978");
   });
 
-  it("explains training and graph modules in detailed help messages", () => {
+  it("explains current Discord command surfaces in help messages", () => {
+    const help = helpMessage();
     const trainingHelp = trainingHelpMessage();
     const graphHelp = graphsHelpMessage();
+    const practiceHelp = practiceHelpMessage();
 
+    expect(help).toContain("`/link username:<atcoder>`");
+    expect(help).toContain("`/gimme [category] [range] [color] [allow_solved]`");
+    expect(help).toContain("`/train help`");
+    expect(help).toContain("`/practice help`");
+    expect(help).toContain("`/duel challenge`");
+    expect(help).toContain("`/graphs help`");
+    expect(help).toContain("`/practice add link:<url> [name] [note]`");
     expect(trainingHelp).toContain("`/train start [delta]`");
     expect(trainingHelp).toContain("Completed");
     expect(trainingHelp).toContain("AC");
     expect(trainingHelp).toContain("`/train leaderboard [period] [month]`");
+    expect(practiceHelp).toContain("`/practice note text:<note>`");
+    expect(practiceHelp).toContain("current front problem only");
     expect(graphHelp).toContain("`/graphs official [user] [range]`");
     expect(graphHelp).toContain("daily training ELO");
     expect(graphHelp).toContain("verified points");

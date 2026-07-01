@@ -17,8 +17,8 @@ export function pointsForDelta(delta: number): number {
 }
 
 export function updateTrainingRating(current: number, outcome: "completed" | "assisted" | "skipped", targetDelta: number): number {
-  const base = outcome === "completed" ? 100 : outcome === "assisted" ? -50 : -100;
-  const challengeAdjustment = Math.round(targetDelta / 4);
+  const base = outcome === "completed" ? 50 : outcome === "assisted" ? -35 : -70;
+  const challengeAdjustment = Math.round(targetDelta / 10);
   return Math.max(400, Math.min(4000, current + base + challengeAdjustment));
 }
 

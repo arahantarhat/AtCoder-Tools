@@ -68,6 +68,19 @@ export interface ReviewQueueItem {
   consumedAt?: number | undefined;
 }
 
+export interface PracticeProblem {
+  id: number;
+  guildId: string;
+  discordUserId: string;
+  name: string;
+  url: string;
+  note?: string | undefined;
+  position: number;
+  createdAt: number;
+  startedAt?: number | undefined;
+  completedAt?: number | undefined;
+}
+
 export interface LeaderboardEntry {
   discordUserId: string;
   atcoderUsername?: string | undefined;

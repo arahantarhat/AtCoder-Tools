@@ -6,7 +6,7 @@ import { getUtcMonthKey } from "./time";
 import type { DiscordAtCoderService } from "./atcoder";
 import type { DiscordBotStore } from "./storage";
 import type { OfficialRatingPoint } from "../types";
-import type { BotAssignment, Duel, DuelProfile, LinkedUser, PendingLinkChallenge, ProblemFilters, ScoreReason } from "./types";
+import type { BotAssignment, Duel, DuelProfile, LinkedUser, PendingLinkChallenge, PracticeProblem, ProblemFilters, ScoreReason } from "./types";
 import {
   calculateHandicapCoefficient,
   compareDuelSolves,
@@ -134,6 +134,55 @@ export class DiscordTrainingBotService {
 
   getDataset(username: string): Promise<AtCoderDataset> {
     return this.atcoder.getDataset(username);
+  }
+
+  addPracticeProblem(
+    guildId: string,
+    discordUserId: string,
+    url: string,
+    name?: string | undefined,
+    note?: string | undefined,
+    now = nowSecond()
+  ): PracticeProblem {
+    const parsedUrl = parsePracticeUrl(url);
+    return this.store.addPracticeProblem({
+      guildId,
+      discordUserId,
+      name: normalizePracticeText(name) ?? parsedUrl.toString(),
+      url: parsedUrl.toString(),
+      note: normalizePracticeText(note),
+      createdAt: now
+    });
+  }
+
+  startPracticeProblem(guildId: string, discordUserId: string, now = nowSecond()): PracticeProblem {
+    const problem = this.store.startPracticeProblem(guildId, discordUserId, now);
+    if (!problem) throw new Error("Your practice queue is empty. Use /practice add first.");
+    return problem;
+  }
+
+  completeCurrentPracticeProblem(guildId: string, discordUserId: string, now = nowSecond()): PracticeProblem {
+    const problem = this.store.completeCurrentPracticeProblem(guildId, discordUserId, now);
+    if (!problem) throw new Error("Your practice queue is empty. Use /practice add first.");
+    return problem;
+  }
+
+  moveCurrentPracticeProblemToBack(guildId: string, discordUserId: string): PracticeProblem {
+    const problem = this.store.moveCurrentPracticeProblemToBack(guildId, discordUserId);
+    if (!problem) throw new Error("Your practice queue is empty. Use /practice add first.");
+    return problem;
+  }
+
+  addCurrentPracticeNote(guildId: string, discordUserId: string, note: string): PracticeProblem {
+    const normalized = normalizePracticeText(note);
+    if (!normalized) throw new Error("Practice note cannot be empty.");
+    const problem = this.store.appendCurrentPracticeNote(guildId, discordUserId, normalized);
+    if (!problem) throw new Error("Your practice queue is empty. Use /practice add first.");
+    return problem;
+  }
+
+  listPracticeQueue(guildId: string, discordUserId: string): PracticeProblem[] {
+    return this.store.listPracticeQueue(guildId, discordUserId);
   }
 
   async resolveTraining(
@@ -463,6 +512,22 @@ function duelFiltersFromPending(duel: Duel): ProblemFilters {
 
 function createLinkVerificationCode(): string {
   return `ACD-${randomBytes(6).toString("base64url")}`;
+}
+
+function parsePracticeUrl(input: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(input.trim());
+  } catch {
+    throw new Error("Practice link must be a valid URL.");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("Practice link must use http or https.");
+  return parsed;
+}
+
+function normalizePracticeText(input: string | undefined): string | undefined {
+  const value = input?.trim();
+  return value ? value : undefined;
 }
 
 function pendingStatusFor(outcome: ScoreReason): "pending_completed" | "pending_assisted" {

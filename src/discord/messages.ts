@@ -2,19 +2,41 @@ import type { APIEmbed, ActionRowData, ButtonComponentData, MessageActionRowComp
 import { ButtonStyle, ComponentType } from "discord-api-types/v10";
 import { formatDate } from "./time";
 import { duelResultLabel } from "./duels";
-import type { BotAssignment, Duel, LeaderboardEntry, LinkedUser, ReviewQueueItem } from "./types";
+import type { BotAssignment, Duel, LeaderboardEntry, LinkedUser, PracticeProblem, ReviewQueueItem } from "./types";
 
 export function helpMessage(): string {
   return [
     "**AtCoder training bot**",
-    "1. `/link username:<atcoder>` to connect your AtCoder handle with a public profile code.",
-    "2. `/gimme` for a filtered random problem.",
-    "3. `/train start` for an adaptive gitgud-style problem.",
-    "4. Use Completed, Assisted, or Skip buttons. Completion points are awarded after public AC verification.",
-    "5. Use `/train verify` to retry pending completion checks.",
-    "6. `/train queue` reviews assisted/skipped problems later, and `/train review` starts the next due review.",
-    "7. Use `/duel` to challenge linked server members.",
-    "8. Use `/train status`, `/train leaderboard`, and `/graphs` to show progress."
+    "",
+    "`/link username:<atcoder>` links your Discord account to AtCoder with a public profile code.",
+    "`/gimme [category] [range] [color] [allow_solved]` gives you a filtered random AtCoder problem without creating an active training assignment.",
+    "",
+    "`/train help` explains adaptive training, scoring, verification, and review.",
+    "`/train start [delta]` starts one adaptive AtCoder assignment.",
+    "`/train current` shows your active assignment.",
+    "`/train completed`, `/train assisted`, and `/train skip` resolve the active assignment. Buttons do the same when shown.",
+    "`/train verify` retries pending AC checks.",
+    "`/train queue` and `/train review` manage assisted/skipped AtCoder review problems.",
+    "`/train status [user]` and `/train leaderboard [period] [month]` show training progress.",
+    "",
+    "`/practice help` explains the personal practice queue for problems from any site.",
+    "`/practice add link:<url> [name] [note]`, `/practice start`, `/practice note`, `/practice later`, `/practice complete`, and `/practice list` manage that queue.",
+    "",
+    "`/duel challenge`, `/duel accept`, `/duel deny`, `/duel status`, `/duel verify`, and `/duel history` manage AtCoder duels.",
+    "`/graphs help` explains `/graphs official`, `/graphs training`, `/graphs points`, and `/graphs solved`."
+  ].join("\n");
+}
+
+export function practiceHelpMessage(): string {
+  return [
+    "**Practice queue**",
+    "",
+    "`/practice add link:<url> [name] [note]` adds a problem to the back of your personal queue.",
+    "`/practice start` shows the problem at the front of the queue.",
+    "`/practice note text:<note>` appends a note to the current front problem only.",
+    "`/practice later` moves the current front problem to the back of the queue.",
+    "`/practice complete` marks the current front problem done.",
+    "`/practice list` shows the current queue order."
   ].join("\n");
 }
 
@@ -189,6 +211,22 @@ export function queueMessage(items: ReviewQueueItem[]): string {
   ).join("\n");
 }
 
+export function practiceProblemMessage(problem: PracticeProblem, prefix: string): string {
+  return [
+    `${prefix}: [${problem.name}](${problem.url})`,
+    problem.note ? `Note: ${problem.note}` : ""
+  ].filter(Boolean).join("\n");
+}
+
+export function practiceListMessage(items: PracticeProblem[]): string {
+  if (items.length === 0) return "Your practice queue is empty.";
+  return items.map((item, index) => {
+    const marker = index === 0 ? "current" : "queued";
+    const note = item.note ? ` - ${firstLine(item.note)}` : "";
+    return `${index + 1}. [${item.name}](${item.url}) (${marker})${note}`;
+  }).join("\n");
+}
+
 function button(
   customId: string,
   label: string,
@@ -205,4 +243,8 @@ function button(
 function formatDelta(delta: number | undefined): string {
   if (delta === undefined) return "-";
   return `${delta >= 0 ? "+" : ""}${delta}`;
+}
+
+function firstLine(value: string): string {
+  return value.split("\n")[0] ?? value;
 }

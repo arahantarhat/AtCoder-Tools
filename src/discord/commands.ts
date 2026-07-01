@@ -21,6 +21,9 @@ import {
   graphsHelpMessage,
   helpMessage,
   leaderboardMessage,
+  practiceHelpMessage,
+  practiceListMessage,
+  practiceProblemMessage,
   profileMessage,
   queueMessage,
   trainingButtons,
@@ -110,6 +113,24 @@ export function buildDiscordCommands(): RESTPostAPIChatInputApplicationCommandsJ
         .setName("history")
         .setDescription("Show recent completed duels.")
         .addUserOption((option) => option.setName("user").setDescription("Discord user"))),
+    new SlashCommandBuilder()
+      .setName("practice")
+      .setDescription("Manage a simple personal practice queue.")
+      .addSubcommand((command) => command.setName("help").setDescription("Explain the practice queue."))
+      .addSubcommand((command) => command
+        .setName("add")
+        .setDescription("Add a problem link to the back of your practice queue.")
+        .addStringOption((option) => option.setName("link").setDescription("Problem URL").setRequired(true))
+        .addStringOption((option) => option.setName("name").setDescription("Display name for the problem"))
+        .addStringOption((option) => option.setName("note").setDescription("Optional note for this problem")))
+      .addSubcommand((command) => command.setName("start").setDescription("Show the current problem at the front of your queue."))
+      .addSubcommand((command) => command.setName("later").setDescription("Move the current problem to the back of your queue."))
+      .addSubcommand((command) => command.setName("complete").setDescription("Complete the current problem at the front of your queue."))
+      .addSubcommand((command) => command
+        .setName("note")
+        .setDescription("Append a note to the current problem only.")
+        .addStringOption((option) => option.setName("text").setDescription("Note to add to the current problem").setRequired(true)))
+      .addSubcommand((command) => command.setName("list").setDescription("List your open practice queue.")),
     buildGraphCommand("graphs", "Render progress graphs.")
   ].map((command) => command.toJSON());
 }
@@ -148,7 +169,7 @@ export async function handleInteraction(interaction: Interaction, service: Disco
 }
 
 export function shouldReplyEphemerally(commandName: string, subcommand?: string): boolean {
-  if (commandName === "link" || commandName === "help") return true;
+  if (commandName === "link" || commandName === "help" || commandName === "practice") return true;
   if (subcommand === "help") return true;
   if (commandName !== "train") return false;
   return subcommand === "queue";
@@ -193,10 +214,75 @@ async function routeCommand(interaction: ChatInputCommandInteraction, service: D
     case "duel":
       await handleDuelCommand(interaction, service);
       return;
+    case "practice":
+      await handlePracticeCommand(interaction, service);
+      return;
     case "graphs": {
       await handleGraphCommand(interaction, service, store);
       return;
     }
+  }
+}
+
+async function handlePracticeCommand(interaction: ChatInputCommandInteraction, service: DiscordTrainingBotService): Promise<void> {
+  const guildId = interaction.guildId!;
+  const discordUserId = interaction.user.id;
+  const subcommand = interaction.options.getSubcommand();
+  if (subcommand === "help") {
+    await sendInteractionResponse(interaction, { content: practiceHelpMessage(), ephemeral: shouldReplyEphemerally("practice", subcommand) });
+    return;
+  }
+  if (subcommand === "add") {
+    const problem = service.addPracticeProblem(
+      guildId,
+      discordUserId,
+      interaction.options.getString("link", true),
+      interaction.options.getString("name") ?? undefined,
+      interaction.options.getString("note") ?? undefined
+    );
+    await sendInteractionResponse(interaction, {
+      content: practiceProblemMessage(problem, "Added practice problem"),
+      ephemeral: shouldReplyEphemerally("practice", subcommand)
+    });
+    return;
+  }
+  if (subcommand === "start") {
+    const problem = service.startPracticeProblem(guildId, discordUserId);
+    await sendInteractionResponse(interaction, {
+      content: practiceProblemMessage(problem, "Current practice problem"),
+      ephemeral: shouldReplyEphemerally("practice", subcommand)
+    });
+    return;
+  }
+  if (subcommand === "later") {
+    const problem = service.moveCurrentPracticeProblemToBack(guildId, discordUserId);
+    await sendInteractionResponse(interaction, {
+      content: practiceProblemMessage(problem, "Moved to the back of your practice queue"),
+      ephemeral: shouldReplyEphemerally("practice", subcommand)
+    });
+    return;
+  }
+  if (subcommand === "complete") {
+    const problem = service.completeCurrentPracticeProblem(guildId, discordUserId);
+    await sendInteractionResponse(interaction, {
+      content: practiceProblemMessage(problem, "Completed practice problem"),
+      ephemeral: shouldReplyEphemerally("practice", subcommand)
+    });
+    return;
+  }
+  if (subcommand === "note") {
+    const problem = service.addCurrentPracticeNote(guildId, discordUserId, interaction.options.getString("text", true));
+    await sendInteractionResponse(interaction, {
+      content: practiceProblemMessage(problem, "Updated current practice problem"),
+      ephemeral: shouldReplyEphemerally("practice", subcommand)
+    });
+    return;
+  }
+  if (subcommand === "list") {
+    await sendInteractionResponse(interaction, {
+      content: practiceListMessage(service.listPracticeQueue(guildId, discordUserId)),
+      ephemeral: shouldReplyEphemerally("practice", subcommand)
+    });
   }
 }
 
